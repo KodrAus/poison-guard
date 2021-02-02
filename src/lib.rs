@@ -1,22 +1,152 @@
 pub mod guard {
+    /*!
+    Panic-safe initialization and cleanup.
+
+    ## Is this just `try`/`catch`?
+
+    Absolutely not, where did you learn such words?
+    Once an exception has been caught, `catch` gives you tools to determine how its propagated.
+    You may choose to ignore, rethrow, or repackage it.
+    These functions don't let you catch a panic that occurs, just run some extra code along the way.
+
+    ## Is this just `try`/`finally` then?
+
+    That's a little closer, but still not quite there.
+    A `finally` block executes on both normal and exceptional paths, where the unwind closures here only execute after a panic.
+    */
+
     use std::{
+        cell::UnsafeCell,
         mem::{self, MaybeUninit},
         ops, ptr,
     };
 
+    /**
+    Attempt to initialize a value that may panic.
+
+    The initialization function will be called to produce a value, `T`, from a `MaybeUninit<T>`.
+    If the initialization function panics, then the unwind function will be called.
+    This gives the caller a chance to clean up any partially initialized state and avoid leaks.
+
+    The state value is shared between initialization and unwinding so it can be used to determine
+    what was and wasn't initialized.
+    */
+    pub fn init_unwind_safe<S, T>(
+        state: S,
+        init: impl FnOnce(&mut S, InitCell<T>) -> T,
+        on_unwind: impl FnOnce(&mut S, UnwoundCell<T>),
+    ) -> T {
+        // The value to initialize and state are stored in `UnsafeCell`s
+        // They're shared between the drop impl for a guard and the init closure
+        // Only one of these sources can access the values at a time
+        let uninit = UnsafeCell::new(Some(MaybeUninit::<T>::uninit()));
+        let state = UnsafeCell::new(state);
+
+        let guard = InitGuard(&state, &uninit, Some(on_unwind));
+
+        // Run the initialization function
+        let init = init(
+            unsafe { &mut *state.get() },
+            InitCell(unsafe { &mut *uninit.get() }),
+        );
+
+        // Drop the unwind guard
+        // This happens in a specific order:
+        // - First, ensure the uninitialized state is `None`, this prevents the `on_unwind` closure from running
+        // - Next, drop the guard (which won't then do any work, but will drop the `on_unwind` closure)
+        // - Finally, drop the state value after the guard has had a chance to access it
+
+        // SAFETY: This exclusive access to the inner value doesn't overlap a borrow given to the init closure or drop guard
+        drop(unsafe { &mut *uninit.get() }.take());
+        drop(guard);
+        drop(state);
+
+        init
+    }
+
+    /**
+    Attempt to initialize a value that may fail or panic.
+
+    The initialization function will be called to try produce a value, `T`, from a `MaybeUninit<T>`.
+    If the initialization function fails or panics, then the unwind function will be called.
+    This gives the caller a chance to clean up any partially initialized state and avoid leaks.
+
+    The state value is shared between initialization and unwinding so it can be used to determine
+    what was and wasn't initialized.
+    */
+    pub fn try_init_unwind_safe<S, T, E>(
+        state: S,
+        try_init: impl FnOnce(&mut S, InitCell<T>) -> Result<T, E>,
+        on_err_unwind: impl FnOnce(&mut S, UnwoundCell<T>),
+    ) -> Result<T, E> {
+        // The value to initialize and state are stored in `UnsafeCell`s
+        // They're shared between the drop impl for a guard and the init closure
+        // Only one of these sources can access the values at a time
+        let uninit = UnsafeCell::new(Some(MaybeUninit::<T>::uninit()));
+        let state = UnsafeCell::new(state);
+
+        let guard = InitGuard(&state, &uninit, Some(on_err_unwind));
+
+        // Run the initialization function
+        match try_init(
+            unsafe { &mut *state.get() },
+            InitCell(unsafe { &mut *uninit.get() }),
+        ) {
+            Ok(init) => {
+                // Drop the unwind guard
+                // This happens in a specific order:
+                // - First, ensure the uninitialized state is `None`, this prevents the `on_err_unwind` closure from running
+                // - Next, drop the guard (which won't then do any work, but will drop the `on_err_unwind` closure)
+                // - Finally, drop the state value after the guard has had a chance to access it
+
+                // SAFETY: This exclusive access to the inner value doesn't overlap a borrow given to the init closure or drop guard
+                drop(unsafe { &mut *uninit.get() }.take());
+                drop(guard);
+                drop(state);
+
+                Ok(init)
+            }
+            Err(e) => {
+                // Drop the unwind guard
+                // Since initialization failed this will execute the unwind closure before returning the error
+
+                drop(guard);
+                drop(state);
+
+                Err(e)
+            }
+        }
+    }
+
+    /**
+    An uninitialized value.
+
+    This type is a wrapper around a `MaybeUninit<T>`.
+    */
     pub struct InitCell<'a, T>(&'a mut Option<MaybeUninit<T>>);
 
     impl<'a, T> InitCell<'a, T> {
+        /**
+        Get a reference to the value to initialize.
+        */
         pub fn get_mut(&mut self) -> &mut MaybeUninit<T> {
             self.0.as_mut().unwrap()
         }
 
+        /**
+        Consider the value fully initialized.
+
+        This has the same safety requirements as `MaybeUninit::assume_init`.
+        */
         pub unsafe fn assume_init(self) -> T {
             self.0.take().unwrap().assume_init()
         }
     }
 
     impl<'a, T, const N: usize> InitCell<'a, [T; N]> {
+        /**
+        Get a reference to the value to initialize as an array.
+        */
         pub fn array_mut(&mut self) -> &mut [MaybeUninit<T>; N] {
             unsafe {
                 mem::transmute::<&mut mem::MaybeUninit<[T; N]>, &mut [mem::MaybeUninit<T>; N]>(
@@ -26,15 +156,27 @@ pub mod guard {
         }
     }
 
+    /**
+    A potentially initialized value.
+
+    This type is a wrapper around a `MaybeUninit<T>`.
+    It's up to the caller to figure out how to drop any partially initialized state in the value.
+    */
     pub struct UnwoundCell<T>(MaybeUninit<T>);
 
     impl<T> UnwoundCell<T> {
+        /**
+        Take the partially initialized value.
+        */
         pub fn into_inner(self) -> MaybeUninit<T> {
             self.0
         }
     }
 
     impl<T, const N: usize> UnwoundCell<[T; N]> {
+        /**
+        Take the partially initialized value as an array.
+        */
         pub fn into_array(mut self) -> [MaybeUninit<T>; N] {
             unsafe {
                 ptr::read(
@@ -44,46 +186,36 @@ pub mod guard {
         }
     }
 
-    pub fn init<S, T>(
-        mut state: S,
-        init: impl FnOnce(&mut S, InitCell<T>) -> T,
-        on_unwind: impl FnOnce(&mut S, UnwoundCell<T>),
-    ) -> T {
-        struct InitGuard<S, T, F>(*mut S, *mut Option<MaybeUninit<T>>, Option<F>)
-        where
-            F: FnOnce(&mut S, UnwoundCell<T>);
+    struct InitGuard<'a, S, T, F>(
+        &'a UnsafeCell<S>,
+        &'a UnsafeCell<Option<MaybeUninit<T>>>,
+        Option<F>,
+    )
+    where
+        F: FnOnce(&mut S, UnwoundCell<T>);
 
-        impl<S, T, F> ops::Drop for InitGuard<S, T, F>
-        where
-            F: FnOnce(&mut S, UnwoundCell<T>),
-        {
-            fn drop(&mut self) {
-                if let Some(unwound) = unsafe { &mut *self.1 }.take() {
-                    let state = unsafe { &mut *self.0 };
+    impl<'a, S, T, F> ops::Drop for InitGuard<'a, S, T, F>
+    where
+        F: FnOnce(&mut S, UnwoundCell<T>),
+    {
+        fn drop(&mut self) {
+            // SAFETY: This exclusive access to the inner value doesn't overlap a borrow given to the init closure
+            // It's run in the drop impl of this guard _after_ the init closure has returned or unwound
+            if let Some(unwound) = unsafe { &mut *self.1.get() }.take() {
+                // SAFETY: This exclusive access to the state doesn't overlap a borrow given to the init closure
+                let state = unsafe { &mut *self.0.get() };
 
-                    (self.2.take().unwrap())(state, UnwoundCell(unwound));
-                }
+                (self.2.take().unwrap())(state, UnwoundCell(unwound));
             }
         }
-
-        let mut uninit = Some(MaybeUninit::<T>::uninit());
-        let guard = InitGuard(
-            &mut state as *mut S,
-            &mut uninit as *mut Option<MaybeUninit<T>>,
-            Some(on_unwind),
-        );
-
-        let init = init(&mut state, InitCell(&mut uninit));
-        let _ = uninit.take();
-
-        drop(guard);
-        drop(state);
-
-        init
     }
 }
 
 pub mod poison {
+    /*!
+    Panic-safe containers.
+    */
+
     use std::{fmt, ops, panic};
 
     /**
@@ -113,6 +245,9 @@ pub mod poison {
             }
         }
 
+        /**
+        Try create a new `Poison<T>` with an initialization function that may panic.
+        */
         pub fn catch_unwind(f: impl FnOnce() -> T) -> Self {
             match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
                 Ok(v) => Poison {
@@ -128,6 +263,28 @@ pub mod poison {
             }
         }
 
+        /**
+        Try create a new `Poison<T>` with an initialization function that may fail or panic.
+        */
+        pub fn try_catch_unwind<E>(f: impl FnOnce() -> Result<T, E>) -> Self {
+            match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
+                Ok(Ok(v)) => Poison {
+                    poisoned: false,
+                    recover_on_drop: true,
+                    value: Some(v),
+                },
+                // TODO: Can we actually capture the `E` somehow?
+                _ => Poison {
+                    poisoned: true,
+                    recover_on_drop: true,
+                    value: None,
+                },
+            }
+        }
+
+        /**
+        Whether or not the `Poison<T>` is actually poisoned.
+        */
         pub fn is_poisoned(&self) -> bool {
             self.poisoned || self.value.is_none()
         }
@@ -144,12 +301,16 @@ pub mod poison {
 
         // NOTE: We can *almost* use arbitrary self types here (at least while they still work on inherent methods)
         // but can't because it breaks auto-ref
+        /**
+        Try poison the value contained behind some target reference and return a guard to it.
+        */
         pub fn poison_target<'a, Target>(
             mut target: Target,
         ) -> Result<PoisonGuard<'a, T, Target>, PoisonRecover<'a, T, Target>>
         where
             Target: ops::DerefMut<Target = Poison<T>> + 'a,
         {
+            // TODO: Consider safety of adversarial `Deref` impls.
             if target.is_poisoned() {
                 Err(PoisonRecover {
                     target,
@@ -399,7 +560,7 @@ mod tests {
 
         #[test]
         fn init_guard_ok() {
-            let arr: [u8; 16] = crate::guard::init(
+            let arr: [u8; 16] = init_unwind_safe(
                 0usize,
                 |i, mut uninit| {
                     let arr = uninit.array_mut();
@@ -430,36 +591,33 @@ mod tests {
 
         #[test]
         fn init_guard_try_ok() {
-            /*type ToInit = (usize, [mem::MaybeUninit<u8>; 16]);
+            let arr: Result<[u8; 16], &'static str> = try_init_unwind_safe(
+                0usize,
+                |i, mut uninit| {
+                    let arr = uninit.array_mut();
 
-            let (_, init) = InitArgs {
-                to_init: (0, unsafe { mem::MaybeUninit::uninit().assume_init() }),
-                on_init: |(i, arr): &mut ToInit| {
                     while *i < 16 {
                         arr[*i] = mem::MaybeUninit::new(*i as u8);
                         *i += 1;
                     }
 
-                    Ok::<(), &'static str>(())
+                    Ok(unsafe { uninit.assume_init() })
                 },
-                on_err_unwind: |(i, arr): &mut ToInit| {
+                |i, err_unwound| {
+                    let mut arr = err_unwound.into_array();
+
                     for i in 0..*i {
                         unsafe {
                             ptr::drop_in_place(arr[i].as_mut_ptr() as *mut u8);
                         }
                     }
                 },
-            }
-            .try_init()
-            .unwrap();
-
-            let arr = unsafe { mem::transmute::<[mem::MaybeUninit<u8>; 16], [u8; 16]>(init) };
+            );
 
             assert_eq!(
                 [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-                arr
-            );*/
-            unimplemented!()
+                arr.unwrap()
+            );
         }
 
         #[test]
@@ -468,7 +626,7 @@ mod tests {
             let drop_count = Arc::new(Mutex::new(0));
 
             let p = Poison::catch_unwind(|| {
-                let arr: [DropValue; 16] = crate::guard::init(
+                let arr: [DropValue; 16] = init_unwind_safe(
                     0usize,
                     |i, mut uninit| {
                         let arr = uninit.array_mut();
@@ -507,44 +665,45 @@ mod tests {
 
         #[test]
         fn init_guard_try_err() {
-            /*type ToInit = (usize, [mem::MaybeUninit<DropValue>; 16]);
-
             let mut init_count = 0;
             let drop_count = Arc::new(Mutex::new(0));
 
-            let p = Poison::catch_unwind(|| {
-                InitArgs {
-                    to_init: (0, unsafe { mem::MaybeUninit::uninit().assume_init() }),
-                    on_init: |(i, arr): &mut ToInit| {
+            let p = Poison::try_catch_unwind(|| {
+                let arr: Result<[DropValue; 16], &'static str> = try_init_unwind_safe(
+                    0usize,
+                    |i, mut uninit| {
+                        let arr = uninit.array_mut();
+
                         while *i < 16 {
                             arr[*i] = mem::MaybeUninit::new(DropValue(drop_count.clone()));
                             init_count += 1;
 
                             *i += 1;
                             if *i == 8 {
-                                return Err::<(), &'static str>("failed!");
+                                return Err("lol");
                             }
                         }
 
-                        Ok::<(), &'static str>(())
+                        Ok(unsafe { uninit.assume_init() })
                     },
-                    on_err_unwind: |(i, arr): &mut ToInit| {
+                    |i, unwound| {
+                        let mut arr = unwound.into_array();
+
                         for i in 0..*i {
                             unsafe {
                                 ptr::drop_in_place(arr[i].as_mut_ptr() as *mut DropValue);
                             }
                         }
                     },
-                }
-                .try_init()
-                .unwrap();
+                );
+
+                arr
             });
 
             assert!(p.is_poisoned());
 
             assert!(init_count > 0);
-            assert_eq!(init_count, *drop_count.lock().unwrap());*/
-            unimplemented!()
+            assert_eq!(init_count, *drop_count.lock().unwrap());
         }
 
         #[test]
