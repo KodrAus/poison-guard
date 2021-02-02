@@ -1,6 +1,8 @@
 pub mod guard {
     use std::{mem, ops};
 
+    // TODO: There's a general pattern here with `DropArgs`
+    // Instead of calling `init`, we'd call `drop` which on success would forget `T`
     pub struct InitArgs<T, FInit, FUnwind> {
         pub to_init: T,
         pub on_init: FInit,
