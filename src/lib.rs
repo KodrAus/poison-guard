@@ -209,6 +209,8 @@ pub mod guard {
             }
         }
     }
+
+    // TODO: `drop_unwind_safe` and `try_drop_unwind_safe`
 }
 
 pub mod poison {
@@ -249,6 +251,7 @@ pub mod poison {
         Try create a new `Poison<T>` with an initialization function that may panic.
         */
         pub fn catch_unwind(f: impl FnOnce() -> T) -> Self {
+            // We're pretending the `UnwindSafe` and `RefUnwindSafe` traits don't exist
             match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
                 Ok(v) => Poison {
                     poisoned: false,
