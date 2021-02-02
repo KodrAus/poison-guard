@@ -1,81 +1,85 @@
 pub mod guard {
-    use std::{mem, ops};
+    use std::{
+        mem::{self, MaybeUninit},
+        ops, ptr,
+    };
 
-    // TODO: There's a general pattern here with `DropArgs`
-    // Instead of calling `init`, we'd call `drop` which on success would forget `T`
-    pub struct InitArgs<T, FInit, FUnwind> {
-        // TODO: Should this be `ManuallyDrop<T>` or require `MaybeUninit<T>`?
-        // TODO: That would mean adding an explicit state arg
-        pub to_init: T,
-        pub on_init: FInit,
-        pub on_err_unwind: FUnwind,
+    pub struct InitCell<'a, T>(&'a mut Option<MaybeUninit<T>>);
+
+    impl<'a, T> InitCell<'a, T> {
+        pub fn get_mut(&mut self) -> &mut MaybeUninit<T> {
+            self.0.as_mut().unwrap()
+        }
+
+        pub unsafe fn assume_init(self) -> T {
+            self.0.take().unwrap().assume_init()
+        }
     }
 
-    struct InitGuard<T, FUnwind>(Option<mem::ManuallyDrop<T>>, Option<FUnwind>)
-    where
-        FUnwind: FnOnce(&mut T);
-
-    impl<T, FUnwind> ops::Drop for InitGuard<T, FUnwind>
-    where
-        FUnwind: FnOnce(&mut T),
-    {
-        fn drop(&mut self) {
-            if let (Some(mut unwound), Some(on_err_unwind)) = (self.0.take(), self.1.take()) {
-                on_err_unwind(&mut unwound);
-
-                // Since `unwound` is `ManuallyDrop` this won't
-                // actually run any destructors
-                drop(unwound);
+    impl<'a, T, const N: usize> InitCell<'a, [T; N]> {
+        pub fn array_mut(&mut self) -> &mut [MaybeUninit<T>; N] {
+            unsafe {
+                mem::transmute::<&mut mem::MaybeUninit<[T; N]>, &mut [mem::MaybeUninit<T>; N]>(
+                    self.get_mut(),
+                )
             }
         }
     }
 
-    impl<T, FInit, FUnwind> InitArgs<T, FInit, FUnwind>
-    where
-        FUnwind: FnOnce(&mut T),
-    {
-        pub fn init(self) -> T
-        where
-            FInit: FnOnce(&mut T),
-        {
-            let mut guard = InitGuard(Some(mem::ManuallyDrop::new(self.to_init)), Some(self.on_err_unwind));
-            (self.on_init)(guard.0.as_mut().unwrap());
+    pub struct UnwoundCell<T>(MaybeUninit<T>);
 
-            // If we make it this far then we didn't panic
-            // Dropping the guard after taking the value won't run the unwind destructor
-            let value = guard.0.take().unwrap();
-            drop(guard);
-
-            mem::ManuallyDrop::into_inner(value)
+    impl<T> UnwoundCell<T> {
+        pub fn into_inner(self) -> MaybeUninit<T> {
+            self.0
         }
+    }
 
-        pub fn try_init<E>(self) -> Result<T, E>
+    impl<T, const N: usize> UnwoundCell<[T; N]> {
+        pub fn into_array(mut self) -> [MaybeUninit<T>; N] {
+            unsafe {
+                ptr::read(
+                    &mut self.0 as *mut mem::MaybeUninit<[T; N]> as *mut [mem::MaybeUninit<T>; N],
+                )
+            }
+        }
+    }
+
+    pub fn init<S, T>(
+        mut state: S,
+        init: impl FnOnce(&mut S, InitCell<T>) -> T,
+        on_unwind: impl FnOnce(&mut S, UnwoundCell<T>),
+    ) -> T {
+        struct InitGuard<S, T, F>(*mut S, *mut Option<MaybeUninit<T>>, Option<F>)
         where
-            FInit: FnOnce(&mut T) -> Result<(), E>,
+            F: FnOnce(&mut S, UnwoundCell<T>);
+
+        impl<S, T, F> ops::Drop for InitGuard<S, T, F>
+        where
+            F: FnOnce(&mut S, UnwoundCell<T>),
         {
-            let mut guard = InitGuard(Some(mem::ManuallyDrop::new(self.to_init)), Some(self.on_err_unwind));
+            fn drop(&mut self) {
+                if let Some(unwound) = unsafe { &mut *self.1 }.take() {
+                    let state = unsafe { &mut *self.0 };
 
-            match (self.on_init)(guard.0.as_mut().unwrap()) {
-                // If we make it this far then we didn't panic
-                // The initialization succeeded, so return the value
-                Ok(()) => {
-                    let value = guard.0.take().unwrap();
-
-                    // Dropping the guard here won't run a destructor on `uninit`
-                    drop(guard);
-
-                    Ok(mem::ManuallyDrop::into_inner(value))
-                }
-                // If we make it this far then we didn't panic
-                // The initialization failed, so run the unwind destructor
-                Err(err) => {
-                    // Dropping the guard here will run a destructor on `uninit`
-                    drop(guard);
-
-                    Err(err)
+                    (self.2.take().unwrap())(state, UnwoundCell(unwound));
                 }
             }
         }
+
+        let mut uninit = Some(MaybeUninit::<T>::uninit());
+        let guard = InitGuard(
+            &mut state as *mut S,
+            &mut uninit as *mut Option<MaybeUninit<T>>,
+            Some(on_unwind),
+        );
+
+        let init = init(&mut state, InitCell(&mut uninit));
+        let _ = uninit.take();
+
+        drop(guard);
+        drop(state);
+
+        init
     }
 }
 
@@ -284,9 +288,7 @@ mod tests {
         assert!(v.is_poisoned());
 
         // Unpoison the guard and decrement the value back down
-        let guard = v
-            .poison()
-            .unwrap_or_else(|guard| guard.recover(|_| 42));
+        let guard = v.poison().unwrap_or_else(|guard| guard.recover(|_| 42));
 
         assert_eq!(42, *guard);
         drop(guard);
@@ -397,27 +399,28 @@ mod tests {
 
         #[test]
         fn init_guard_ok() {
-            type ToInit = (usize, [mem::MaybeUninit<u8>; 16]);
+            let arr: [u8; 16] = crate::guard::init(
+                0usize,
+                |i, mut uninit| {
+                    let arr = uninit.array_mut();
 
-            let (_, init) = InitArgs {
-                to_init: (0, unsafe { mem::MaybeUninit::uninit().assume_init() }),
-                on_init: |(i, arr): &mut ToInit| {
                     while *i < 16 {
                         arr[*i] = mem::MaybeUninit::new(*i as u8);
                         *i += 1;
                     }
+
+                    unsafe { uninit.assume_init() }
                 },
-                on_err_unwind: |(i, arr): &mut ToInit| {
+                |i, unwound| {
+                    let mut arr = unwound.into_array();
+
                     for i in 0..*i {
                         unsafe {
                             ptr::drop_in_place(arr[i].as_mut_ptr() as *mut u8);
                         }
                     }
                 },
-            }
-            .init();
-
-            let arr = unsafe { mem::transmute::<[mem::MaybeUninit<u8>; 16], [u8; 16]>(init) };
+            );
 
             assert_eq!(
                 [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
@@ -427,7 +430,7 @@ mod tests {
 
         #[test]
         fn init_guard_try_ok() {
-            type ToInit = (usize, [mem::MaybeUninit<u8>; 16]);
+            /*type ToInit = (usize, [mem::MaybeUninit<u8>; 16]);
 
             let (_, init) = InitArgs {
                 to_init: (0, unsafe { mem::MaybeUninit::uninit().assume_init() }),
@@ -455,20 +458,21 @@ mod tests {
             assert_eq!(
                 [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
                 arr
-            );
+            );*/
+            unimplemented!()
         }
 
         #[test]
         fn init_guard_panic() {
-            type ToInit = (usize, [mem::MaybeUninit<DropValue>; 16]);
-
             let mut init_count = 0;
             let drop_count = Arc::new(Mutex::new(0));
 
             let p = Poison::catch_unwind(|| {
-                InitArgs {
-                    to_init: (0, unsafe { mem::MaybeUninit::uninit().assume_init() }),
-                    on_init: |(i, arr): &mut ToInit| {
+                let arr: [DropValue; 16] = crate::guard::init(
+                    0usize,
+                    |i, mut uninit| {
+                        let arr = uninit.array_mut();
+
                         while *i < 16 {
                             arr[*i] = mem::MaybeUninit::new(DropValue(drop_count.clone()));
                             init_count += 1;
@@ -478,16 +482,21 @@ mod tests {
                                 panic!("lol");
                             }
                         }
+
+                        unsafe { uninit.assume_init() }
                     },
-                    on_err_unwind: |(i, arr): &mut ToInit| {
+                    |i, unwound| {
+                        let mut arr = unwound.into_array();
+
                         for i in 0..*i {
                             unsafe {
                                 ptr::drop_in_place(arr[i].as_mut_ptr() as *mut DropValue);
                             }
                         }
                     },
-                }
-                .init();
+                );
+
+                arr
             });
 
             assert!(p.is_poisoned());
@@ -498,7 +507,7 @@ mod tests {
 
         #[test]
         fn init_guard_try_err() {
-            type ToInit = (usize, [mem::MaybeUninit<DropValue>; 16]);
+            /*type ToInit = (usize, [mem::MaybeUninit<DropValue>; 16]);
 
             let mut init_count = 0;
             let drop_count = Arc::new(Mutex::new(0));
@@ -534,7 +543,69 @@ mod tests {
             assert!(p.is_poisoned());
 
             assert!(init_count > 0);
-            assert_eq!(init_count, *drop_count.lock().unwrap());
+            assert_eq!(init_count, *drop_count.lock().unwrap());*/
+            unimplemented!()
+        }
+
+        #[test]
+        fn init_guard_special_cleanup() {
+            /*struct DeadLockOnDrop {
+                ready: bool,
+                lock: Arc<Mutex<usize>>,
+            }
+
+            impl DeadLockOnDrop {
+                fn finalize(&mut self) {
+                    match self.lock.clone().try_lock() {
+                        Ok(mut guard) => self.finalize_sync(&mut *guard),
+                        _ => panic!("deadlock!"),
+                    }
+                }
+
+                fn finalize_sync(&mut self, guard: &mut usize) {
+                    *guard += 1;
+                }
+            }
+
+            impl ops::Drop for DeadLockOnDrop {
+                fn drop(&mut self) {
+                    if !self.ready {
+                        self.finalize();
+                    }
+                }
+            }
+
+            let lock = Arc::new(Mutex::new(0));
+
+            let p = Poison::catch_unwind(|| {
+                // Acquire the lock here
+                let mut guard = lock.lock().unwrap();
+
+                // At this point, calling drop on `DeadLockOnDrop` would deadlock
+                let (guard, value) = InitArgs {
+                    to_init: (
+                        &mut *guard,
+                        DeadLockOnDrop {
+                            ready: false,
+                            lock: lock.clone(),
+                        },
+                    ),
+                    on_init: |(guard, value): &mut (&mut usize, DeadLockOnDrop)| {
+                        **guard += 1;
+                        panic!("lol");
+                        value.ready = true;
+                    },
+                    on_err_unwind: |(guard, value): &mut (&mut usize, DeadLockOnDrop)| {
+                        value.finalize_sync(&mut *guard);
+                    },
+                }
+                .init();
+
+                drop(guard);
+
+                value
+            });*/
+            unimplemented!()
         }
 
         #[test]
