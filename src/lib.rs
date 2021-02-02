@@ -4,6 +4,8 @@ pub mod guard {
     // TODO: There's a general pattern here with `DropArgs`
     // Instead of calling `init`, we'd call `drop` which on success would forget `T`
     pub struct InitArgs<T, FInit, FUnwind> {
+        // TODO: Should this be `ManuallyDrop<T>` or require `MaybeUninit<T>`?
+        // TODO: That would mean adding an explicit state arg
         pub to_init: T,
         pub on_init: FInit,
         pub on_err_unwind: FUnwind,
@@ -92,42 +94,38 @@ pub mod poison {
         // TODO: Are there any opportunities to protect invalid state better?
         // TODO: Consider a `Result<T, PoisonPayload>`?
         // TODO: Where PoisonPayload may be PanicPayload or Error + Send + Sync + 'static?
-        value: T,
-    }
-
-    impl Poison<()> {
-        // TODO: Make this work on methods returning `T`
-        // TODO: This means making `Poison` capture a `Option<T>`
-        pub fn catch_unwind(f: impl FnOnce()) -> Self {
-            match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
-                Ok(()) => Poison {
-                    poisoned: false,
-                    recover_on_drop: true,
-                    value: (),
-                },
-                Err(_) => Poison {
-                    poisoned: true,
-                    recover_on_drop: true,
-                    value: (),
-                },
-            }
-        }
+        value: Option<T>,
     }
 
     impl<T> Poison<T> {
         /**
         Create a new `Poison<T>` with a valid inner value.
         */
-        pub fn new(value: T) -> Self {
+        pub fn new(v: T) -> Self {
             Poison {
                 poisoned: false,
                 recover_on_drop: true,
-                value,
+                value: Some(v),
+            }
+        }
+
+        pub fn catch_unwind(f: impl FnOnce() -> T) -> Self {
+            match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
+                Ok(v) => Poison {
+                    poisoned: false,
+                    recover_on_drop: true,
+                    value: Some(v),
+                },
+                Err(_) => Poison {
+                    poisoned: true,
+                    recover_on_drop: true,
+                    value: None,
+                },
             }
         }
 
         pub fn is_poisoned(&self) -> bool {
-            self.poisoned
+            self.poisoned || self.value.is_none()
         }
 
         /**
@@ -148,7 +146,7 @@ pub mod poison {
         where
             Target: ops::DerefMut<Target = Poison<T>> + 'a,
         {
-            if target.poisoned {
+            if target.is_poisoned() {
                 Err(PoisonRecover {
                     target,
                     _marker: Default::default(),
@@ -207,7 +205,7 @@ pub mod poison {
         type Target = T;
 
         fn deref(&self) -> &T {
-            &self.target.value
+            self.target.value.as_ref().expect("invalid poison")
         }
     }
 
@@ -216,7 +214,7 @@ pub mod poison {
         Target: ops::DerefMut<Target = Poison<T>>,
     {
         fn deref_mut(&mut self) -> &mut T {
-            &mut self.target.value
+            self.target.value.as_mut().expect("invalid poison")
         }
     }
 
@@ -236,8 +234,8 @@ pub mod poison {
         Target: ops::DerefMut<Target = Poison<T>>,
     {
         // TODO: Will this always just be the same function if recovery is possible?
-        pub fn recover(mut self, f: impl FnOnce(&mut T)) -> PoisonGuard<'a, T, Target> {
-            f(&mut self.target.value);
+        pub fn recover(mut self, f: impl FnOnce(Option<T>) -> T) -> PoisonGuard<'a, T, Target> {
+            self.target.value = Some(f(self.target.value.take()));
 
             PoisonGuard {
                 target: self.target,
@@ -288,7 +286,7 @@ mod tests {
         // Unpoison the guard and decrement the value back down
         let guard = v
             .poison()
-            .unwrap_or_else(|guard| guard.recover(|v| *v = 42));
+            .unwrap_or_else(|guard| guard.recover(|_| 42));
 
         assert_eq!(42, *guard);
         drop(guard);
@@ -378,7 +376,7 @@ mod tests {
             let guard = mutex
                 .lock()
                 .poison()
-                .unwrap_or_else(|guard| guard.recover(|v| *v = 42));
+                .unwrap_or_else(|guard| guard.recover(|_| 42));
 
             assert_eq!(42, *guard);
         }
