@@ -30,11 +30,17 @@ pub mod guard {
 
     The state value is shared between initialization and unwinding so it can be used to determine
     what was and wasn't initialized.
+
+    If the unwind function panics then it may trigger an abort.
     */
     pub fn init_unwind_safe<S, T>(
         state: S,
-        init: impl FnOnce(&mut S, InitCell<T>) -> T,
-        on_unwind: impl FnOnce(&mut S, UnwoundCell<T>),
+        // TODO: Make this `FnOnce(S, MaybeUninitSlot)`
+        init: impl for<'state, 'init> FnOnce(
+            &'state mut S,
+            MaybeUninitSlot<'init, T>,
+        ) -> InitSlot<'init, T>,
+        on_unwind: impl for<'state> FnOnce(&'state mut S, UnwoundSlot<T>),
     ) -> T {
         // The value to initialize and state are stored in `UnsafeCell`s
         // They're shared between the drop impl for a guard and the init closure
@@ -47,7 +53,7 @@ pub mod guard {
         // Run the initialization function
         let init = init(
             unsafe { &mut *state.get() },
-            InitCell(unsafe { &mut *uninit.get() }),
+            MaybeUninitSlot(unsafe { &mut *uninit.get() }),
         );
 
         // Drop the unwind guard
@@ -56,12 +62,12 @@ pub mod guard {
         // - Next, drop the guard (which won't then do any work, but will drop the `on_unwind` closure)
         // - Finally, drop the state value after the guard has had a chance to access it
 
-        // SAFETY: This exclusive access to the inner value doesn't overlap a borrow given to the init closure or drop guard
-        drop(unsafe { &mut *uninit.get() }.take());
+        let value = mem::ManuallyDrop::new(InitSlot::into_inner(init));
+
         drop(guard);
         drop(state);
 
-        init
+        mem::ManuallyDrop::into_inner(value)
     }
 
     /**
@@ -73,11 +79,17 @@ pub mod guard {
 
     The state value is shared between initialization and unwinding so it can be used to determine
     what was and wasn't initialized.
+
+    If the unwind function panics then it may trigger an abort.
     */
     pub fn try_init_unwind_safe<S, T, E>(
         state: S,
-        try_init: impl FnOnce(&mut S, InitCell<T>) -> Result<T, E>,
-        on_err_unwind: impl FnOnce(&mut S, UnwoundCell<T>),
+        // TODO: Make this `FnOnce(S, MaybeUninitSlot) -> Result<(), E>`
+        try_init: impl for<'state, 'init> FnOnce(
+            &'state mut S,
+            MaybeUninitSlot<'init, T>,
+        ) -> Result<InitSlot<'init, T>, E>,
+        on_err_unwind: impl for<'state> FnOnce(&'state mut S, UnwoundSlot<T>),
     ) -> Result<T, E> {
         // The value to initialize and state are stored in `UnsafeCell`s
         // They're shared between the drop impl for a guard and the init closure
@@ -90,7 +102,7 @@ pub mod guard {
         // Run the initialization function
         match try_init(
             unsafe { &mut *state.get() },
-            InitCell(unsafe { &mut *uninit.get() }),
+            MaybeUninitSlot(unsafe { &mut *uninit.get() }),
         ) {
             Ok(init) => {
                 // Drop the unwind guard
@@ -99,12 +111,12 @@ pub mod guard {
                 // - Next, drop the guard (which won't then do any work, but will drop the `on_err_unwind` closure)
                 // - Finally, drop the state value after the guard has had a chance to access it
 
-                // SAFETY: This exclusive access to the inner value doesn't overlap a borrow given to the init closure or drop guard
-                drop(unsafe { &mut *uninit.get() }.take());
+                let value = mem::ManuallyDrop::new(InitSlot::into_inner(init));
+
                 drop(guard);
                 drop(state);
 
-                Ok(init)
+                Ok(mem::ManuallyDrop::into_inner(value))
             }
             Err(e) => {
                 // Drop the unwind guard
@@ -119,13 +131,45 @@ pub mod guard {
     }
 
     /**
-    An uninitialized value.
+    A potentially uninitialized value.
 
     This type is a wrapper around a `MaybeUninit<T>`.
     */
-    pub struct InitCell<'a, T>(&'a mut Option<MaybeUninit<T>>);
+    pub struct MaybeUninitSlot<'a, T>(&'a mut Option<MaybeUninit<T>>);
 
-    impl<'a, T> InitCell<'a, T> {
+    /**
+    An initialized value.
+
+    This is the result of initializing a `MaybeUninitSlot`.
+    */
+    pub struct InitSlot<'a, T>(MaybeUninitSlot<'a, T>);
+
+    impl<'a, T> InitSlot<'a, T> {
+        fn into_inner(slot: Self) -> T {
+            // SAFETY: An `InitSlot` can only be created from an initialized value
+            unsafe { (slot.0).0.take().unwrap().assume_init() }
+        }
+    }
+
+    impl<'a, T> ops::Deref for InitSlot<'a, T> {
+        type Target = T;
+
+        fn deref(&self) -> &T {
+            unsafe { &*self.0.get().as_ptr() }
+        }
+    }
+
+    impl<'a, T> ops::DerefMut for InitSlot<'a, T> {
+        fn deref_mut(&mut self) -> &mut T {
+            unsafe { &mut *self.0.get_mut().as_mut_ptr() }
+        }
+    }
+
+    impl<'a, T> MaybeUninitSlot<'a, T> {
+        fn get(&self) -> &MaybeUninit<T> {
+            self.0.as_ref().unwrap()
+        }
+
         /**
         Get a reference to the value to initialize.
         */
@@ -134,16 +178,27 @@ pub mod guard {
         }
 
         /**
+        Initialize the value.
+
+        Any previously initialized state will be overwritten without being dropped.
+        */
+        pub fn init(self, value: T) -> InitSlot<'a, T> {
+            *self.0.as_mut().unwrap() = MaybeUninit::new(value);
+            InitSlot(self)
+        }
+
+        /**
         Consider the value fully initialized.
 
         This has the same safety requirements as `MaybeUninit::assume_init`.
         */
-        pub unsafe fn assume_init(self) -> T {
-            self.0.take().unwrap().assume_init()
+        pub unsafe fn assume_init(self) -> InitSlot<'a, T> {
+            // TODO: Should this actually mark us as initialized?
+            InitSlot(self)
         }
     }
 
-    impl<'a, T, const N: usize> InitCell<'a, [T; N]> {
+    impl<'a, T, const N: usize> MaybeUninitSlot<'a, [T; N]> {
         /**
         Get a reference to the value to initialize as an array.
         */
@@ -162,9 +217,9 @@ pub mod guard {
     This type is a wrapper around a `MaybeUninit<T>`.
     It's up to the caller to figure out how to drop any partially initialized state in the value.
     */
-    pub struct UnwoundCell<T>(MaybeUninit<T>);
+    pub struct UnwoundSlot<T>(MaybeUninit<T>);
 
-    impl<T> UnwoundCell<T> {
+    impl<T> UnwoundSlot<T> {
         /**
         Take the partially initialized value.
         */
@@ -173,7 +228,7 @@ pub mod guard {
         }
     }
 
-    impl<T, const N: usize> UnwoundCell<[T; N]> {
+    impl<T, const N: usize> UnwoundSlot<[T; N]> {
         /**
         Take the partially initialized value as an array.
         */
@@ -192,11 +247,11 @@ pub mod guard {
         Option<F>,
     )
     where
-        F: FnOnce(&mut S, UnwoundCell<T>);
+        F: FnOnce(&mut S, UnwoundSlot<T>);
 
     impl<'a, S, T, F> ops::Drop for InitGuard<'a, S, T, F>
     where
-        F: FnOnce(&mut S, UnwoundCell<T>),
+        F: FnOnce(&mut S, UnwoundSlot<T>),
     {
         fn drop(&mut self) {
             // SAFETY: This exclusive access to the inner value doesn't overlap a borrow given to the init closure
@@ -205,7 +260,7 @@ pub mod guard {
                 // SAFETY: This exclusive access to the state doesn't overlap a borrow given to the init closure
                 let state = unsafe { &mut *self.0.get() };
 
-                (self.2.take().unwrap())(state, UnwoundCell(unwound));
+                (self.2.take().unwrap())(state, UnwoundSlot(unwound));
             }
         }
     }
@@ -561,6 +616,40 @@ mod tests {
             }
         }
 
+        struct DeadLockOnDrop {
+            ready: bool,
+            finalized: bool,
+            lock: Arc<Mutex<usize>>,
+        }
+
+        impl DeadLockOnDrop {
+            fn finalize(&mut self) {
+                if !self.finalized {
+                    self.finalized = true;
+
+                    match self.lock.clone().try_lock() {
+                        Ok(mut guard) => self.finalize_sync(&mut *guard),
+                        _ => panic!("deadlock!"),
+                    }
+                }
+            }
+
+            fn finalize_sync(&mut self, guard: &mut usize) {
+                if !self.finalized {
+                    self.finalized = true;
+                    *guard += 1;
+                }
+            }
+        }
+
+        impl ops::Drop for DeadLockOnDrop {
+            fn drop(&mut self) {
+                if !self.ready {
+                    self.finalize();
+                }
+            }
+        }
+
         #[test]
         fn init_guard_ok() {
             let arr: [u8; 16] = init_unwind_safe(
@@ -710,69 +799,52 @@ mod tests {
         }
 
         #[test]
-        fn init_guard_special_cleanup() {
-            /*struct DeadLockOnDrop {
-                ready: bool,
-                lock: Arc<Mutex<usize>>,
-            }
-
-            impl DeadLockOnDrop {
-                fn finalize(&mut self) {
-                    match self.lock.clone().try_lock() {
-                        Ok(mut guard) => self.finalize_sync(&mut *guard),
-                        _ => panic!("deadlock!"),
-                    }
-                }
-
-                fn finalize_sync(&mut self, guard: &mut usize) {
-                    *guard += 1;
-                }
-            }
-
-            impl ops::Drop for DeadLockOnDrop {
-                fn drop(&mut self) {
-                    if !self.ready {
-                        self.finalize();
-                    }
-                }
-            }
-
+        fn init_guard_special_cleanup_panic() {
             let lock = Arc::new(Mutex::new(0));
 
             let p = Poison::catch_unwind(|| {
                 // Acquire the lock here
-                let mut guard = lock.lock().unwrap();
+                let guard = lock.lock().unwrap();
 
-                // At this point, calling drop on `DeadLockOnDrop` would deadlock
-                let (guard, value) = InitArgs {
-                    to_init: (
-                        &mut *guard,
-                        DeadLockOnDrop {
+                init_unwind_safe(
+                    guard,
+                    |guard, mut uninit| {
+                        *uninit.get_mut() = mem::MaybeUninit::new(DeadLockOnDrop {
                             ready: false,
+                            finalized: false,
                             lock: lock.clone(),
-                        },
-                    ),
-                    on_init: |(guard, value): &mut (&mut usize, DeadLockOnDrop)| {
-                        **guard += 1;
-                        panic!("lol");
+                        });
+
+                        let mut value = unsafe { uninit.assume_init() };
                         value.ready = true;
+
+                        **guard += 1;
+
+                        if **guard == 1 {
+                            panic!("lol");
+                        }
+
+                        value
                     },
-                    on_err_unwind: |(guard, value): &mut (&mut usize, DeadLockOnDrop)| {
+                    |guard, unwound| {
+                        // We initialized the value before panicking
+                        let mut value = unsafe { unwound.into_inner().assume_init() };
                         value.finalize_sync(&mut *guard);
                     },
-                }
-                .init();
+                )
+            });
 
-                drop(guard);
-
-                value
-            });*/
-            unimplemented!()
+            assert!(p.is_poisoned());
         }
 
         #[test]
         fn init_guard_cheeky_mem_swap() {
             unimplemented!("what can we break with `mem::swap` (internally in `InitArgs`)?")
+        }
+
+        #[test]
+        fn init_guard_try_panic_on_err() {
+            unimplemented!("make sure we don't call `Drop` on the initialized value if `unwind` closure panics")
         }
     }
 }
