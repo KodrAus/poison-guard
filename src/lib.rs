@@ -32,10 +32,12 @@ pub mod guard {
     what was and wasn't initialized.
 
     If the unwind function panics then it may trigger an abort.
+
+    `init_unwind_safe` guarantees that `Drop` won't be called on `T` (barring any use of `mem::{take, swap, replace}`)
+    if the `on_unwind` closure executes.
     */
     pub fn init_unwind_safe<S, T>(
         state: S,
-        // TODO: Make this `FnOnce(S, MaybeUninitSlot)`
         init: impl for<'state, 'init> FnOnce(
             &'state mut S,
             MaybeUninitSlot<'init, T>,
@@ -81,10 +83,12 @@ pub mod guard {
     what was and wasn't initialized.
 
     If the unwind function panics then it may trigger an abort.
+
+    `try_init_unwind_safe` guarantees that `Drop` won't be called on `T` (barring any use of `mem::{take, swap, replace}`)
+    if the `on_err_unwind` closure executes.
     */
     pub fn try_init_unwind_safe<S, T, E>(
         state: S,
-        // TODO: Make this `FnOnce(S, MaybeUninitSlot) -> Result<(), E>`
         try_init: impl for<'state, 'init> FnOnce(
             &'state mut S,
             MaybeUninitSlot<'init, T>,
@@ -193,7 +197,6 @@ pub mod guard {
         This has the same safety requirements as `MaybeUninit::assume_init`.
         */
         pub unsafe fn assume_init(self) -> InitSlot<'a, T> {
-            // TODO: Should this actually mark us as initialized?
             InitSlot(self)
         }
     }
