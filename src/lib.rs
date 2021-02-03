@@ -505,10 +505,13 @@ pub mod poison {
         The guard may or may not actually contain a previous value.
         If it doesn't, the caller will have to produce one to recover with.
         */
+        // TODO: Consider an API like `MaybeUninitSlot` + `InitSlot` where we assign the value
+        // That would let us try recover without necessarily losing the value that's there
         pub fn recover(mut self, f: impl FnOnce(Option<T>) -> T) -> PoisonGuard<'a, T, Target> {
             let value = mem::replace(&mut self.target.value, Err(PoisonError::unknown()));
 
             self.target.value = Ok(f(value.ok()));
+            self.target.poisoned = false;
 
             let recover_on_drop = self.target.recover_on_drop;
             let retain_on_poison = self.target.retain_on_poison;
@@ -539,6 +542,7 @@ pub mod poison {
             match f(value.ok()) {
                 Ok(value) => {
                     self.target.value = Ok(value);
+                    self.target.poisoned = false;
 
                     let recover_on_drop = self.target.recover_on_drop;
                     let retain_on_poison = self.target.retain_on_poison;
