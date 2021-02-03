@@ -808,22 +808,19 @@ mod tests {
 
                 init_unwind_safe(
                     guard,
-                    |guard, mut uninit| {
-                        *uninit.get_mut() = mem::MaybeUninit::new(DeadLockOnDrop {
+                    |guard, uninit| {
+                        let mut value = uninit.init(DeadLockOnDrop {
                             ready: false,
                             finalized: false,
                             lock: lock.clone(),
                         });
 
-                        let mut value = unsafe { uninit.assume_init() };
-                        value.ready = true;
-
                         **guard += 1;
-
                         if **guard == 1 {
                             panic!("lol");
                         }
 
+                        value.ready = true;
                         value
                     },
                     |guard, unwound| {
