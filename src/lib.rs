@@ -1,5 +1,6 @@
 // TODO: Get consistent with terminology: unwind vs panic
 
+// NOTE: Could be `no_std`.
 pub mod guard {
     /*!
     Unwind-safe initialization and cleanup.
@@ -62,6 +63,7 @@ pub mod guard {
 
         // Ensure the guard hasn't been swapped
         // TODO: This check is a reminder to think about implications of `mem::swap` and friends
+        // This _shouldn't_ be possible since we have an arbitrarily small invariant lifetime, but is worth trying to break
         assert_eq!(&uninit as *const _, (init.0).0 as *mut _ as *const _);
 
         // Drop the unwind guard
@@ -123,10 +125,9 @@ pub mod guard {
                 // - Next, drop the guard (which won't then do any work, but will drop the `on_err_unwind` closure)
                 // - Finally, drop the state value after the guard has had a chance to access it
 
-                let init_ptr = (init.0).0 as *mut _ as *const _;
-
                 // Ensure the guard hasn't been swapped
                 // TODO: This check is a reminder to think about implications of `mem::swap` and friends
+                // This _shouldn't_ be possible since we have an arbitrarily small invariant lifetime, but is worth trying to break
                 assert_eq!(&uninit as *const _, (init.0).0 as *mut _ as *const _);
 
                 let value = InitSlot::into_inner(init);
@@ -287,6 +288,7 @@ pub mod guard {
     // TODO: `drop_unwind_safe` and `try_drop_unwind_safe`
 }
 
+// NOTE: Can't be `no_std` because of `catch_unwind`.
 pub mod poison {
     /*!
     Unwind-safe containers.
@@ -297,8 +299,6 @@ pub mod poison {
     /**
     A container that holds a potentially poisoned value.
     */
-    // NOTE: This needs to live in `std`, not `core` because
-    // it interacts with unwinding.
     pub struct Poison<T> {
         // TODO: This could be a `u8` to save space when combining with other flags
         poisoned: bool,
