@@ -1,6 +1,8 @@
+// TODO: Get consistent with terminology: unwind vs panic
+
 pub mod guard {
     /*!
-    Panic-safe initialization and cleanup.
+    Unwind-safe initialization and cleanup.
 
     ## Is this just `try`/`catch`?
 
@@ -57,6 +59,10 @@ pub mod guard {
             unsafe { &mut *state.get() },
             MaybeUninitSlot(unsafe { &mut *uninit.get() }),
         );
+
+        // Ensure the guard hasn't been swapped
+        // TODO: This check is a reminder to think about implications of `mem::swap` and friends
+        assert_eq!(&uninit as *const _, (init.0).0 as *mut _ as *const _);
 
         // Drop the unwind guard
         // This happens in a specific order:
@@ -116,6 +122,12 @@ pub mod guard {
                 // - First, ensure the uninitialized state is `None`, this prevents the `on_err_unwind` closure from running
                 // - Next, drop the guard (which won't then do any work, but will drop the `on_err_unwind` closure)
                 // - Finally, drop the state value after the guard has had a chance to access it
+
+                let init_ptr = (init.0).0 as *mut _ as *const _;
+
+                // Ensure the guard hasn't been swapped
+                // TODO: This check is a reminder to think about implications of `mem::swap` and friends
+                assert_eq!(&uninit as *const _, (init.0).0 as *mut _ as *const _);
 
                 let value = InitSlot::into_inner(init);
 
@@ -277,7 +289,7 @@ pub mod guard {
 
 pub mod poison {
     /*!
-    Panic-safe containers.
+    Unwind-safe containers.
     */
 
     use std::{fmt, ops, panic};
