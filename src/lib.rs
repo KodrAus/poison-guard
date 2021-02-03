@@ -64,12 +64,14 @@ pub mod guard {
         // - Next, drop the guard (which won't then do any work, but will drop the `on_unwind` closure)
         // - Finally, drop the state value after the guard has had a chance to access it
 
-        let value = mem::ManuallyDrop::new(InitSlot::into_inner(init));
+        let value = InitSlot::into_inner(init);
 
+        // Dropping the guard here will never panic, but dropping the state might
+        // If that happens we unwind regularly, since the value is fully initialized
         drop(guard);
         drop(state);
 
-        mem::ManuallyDrop::into_inner(value)
+        value
     }
 
     /**
@@ -115,12 +117,14 @@ pub mod guard {
                 // - Next, drop the guard (which won't then do any work, but will drop the `on_err_unwind` closure)
                 // - Finally, drop the state value after the guard has had a chance to access it
 
-                let value = mem::ManuallyDrop::new(InitSlot::into_inner(init));
+                let value = InitSlot::into_inner(init);
 
+                // Dropping the guard here will never panic, but dropping the state might
+                // If that happens we unwind regularly, since the value is fully initialized
                 drop(guard);
                 drop(state);
 
-                Ok(mem::ManuallyDrop::into_inner(value))
+                Ok(value)
             }
             Err(e) => {
                 // Drop the unwind guard
