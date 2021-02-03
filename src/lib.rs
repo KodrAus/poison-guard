@@ -294,7 +294,7 @@ pub mod poison {
     Unwind-safe containers.
     */
 
-    use std::{fmt, ops, panic};
+    use std::{any::Any, borrow::Cow, error::Error, fmt, mem, ops, panic};
 
     /**
     A container that holds a potentially poisoned value.
@@ -303,10 +303,8 @@ pub mod poison {
         // TODO: This could be a `u8` to save space when combining with other flags
         poisoned: bool,
         recover_on_drop: bool,
-        // TODO: Are there any opportunities to protect invalid state better?
         // TODO: Consider a `Result<T, PoisonPayload>`?
-        // TODO: Where PoisonPayload may be PanicPayload or Error + Send + Sync + 'static?
-        value: Option<T>,
+        value: Result<T, PoisonError>,
     }
 
     impl<T> Poison<T> {
@@ -317,7 +315,7 @@ pub mod poison {
             Poison {
                 poisoned: false,
                 recover_on_drop: true,
-                value: Some(v),
+                value: Ok(v),
             }
         }
 
@@ -330,12 +328,12 @@ pub mod poison {
                 Ok(v) => Poison {
                     poisoned: false,
                     recover_on_drop: true,
-                    value: Some(v),
+                    value: Ok(v),
                 },
-                Err(_) => Poison {
+                Err(panic) => Poison {
                     poisoned: true,
                     recover_on_drop: true,
-                    value: None,
+                    value: Err(PoisonError::from_panic(panic)),
                 },
             }
         }
@@ -343,18 +341,25 @@ pub mod poison {
         /**
         Try create a new `Poison<T>` with an initialization function that may fail or panic.
         */
-        pub fn try_catch_unwind<E>(f: impl FnOnce() -> Result<T, E>) -> Self {
+        pub fn try_catch_unwind<E>(f: impl FnOnce() -> Result<T, E>) -> Self
+        where
+            E: Error + Send + Sync + 'static,
+        {
             match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
                 Ok(Ok(v)) => Poison {
                     poisoned: false,
                     recover_on_drop: true,
-                    value: Some(v),
+                    value: Ok(v),
                 },
-                // TODO: Can we actually capture the `E` somehow?
-                _ => Poison {
+                Ok(Err(e)) => Poison {
+                    poisoned: false,
+                    recover_on_drop: true,
+                    value: Err(PoisonError::from_err(e)),
+                },
+                Err(panic) => Poison {
                     poisoned: true,
                     recover_on_drop: true,
-                    value: None,
+                    value: Err(PoisonError::from_panic(panic)),
                 },
             }
         }
@@ -363,7 +368,7 @@ pub mod poison {
         Whether or not the `Poison<T>` is actually poisoned.
         */
         pub fn is_poisoned(&self) -> bool {
-            self.poisoned || self.value.is_none()
+            self.poisoned || self.value.is_err()
         }
 
         /**
@@ -477,7 +482,9 @@ pub mod poison {
     {
         // TODO: Will this always just be the same function if recovery is possible?
         pub fn recover(mut self, f: impl FnOnce(Option<T>) -> T) -> PoisonGuard<'a, T, Target> {
-            self.target.value = Some(f(self.target.value.take()));
+            let value = mem::replace(&mut self.target.value, Err(PoisonError::recovery_failed()));
+
+            self.target.value = Ok(f(value.ok()));
 
             PoisonGuard {
                 target: self.target,
@@ -492,9 +499,89 @@ pub mod poison {
         Target: ops::DerefMut<Target = Poison<T>>,
     {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.debug_struct("PoisonRecover").finish()
+            match self.target.value {
+                Err(PoisonError::Panic(ref panic)) => f.debug_struct("PoisonRecover").field(&"panic", panic).finish(),
+                Err(ref e) => f.debug_struct("PoisonRecover").field(&"source", e).finish(),
+                Ok(_) => f.debug_struct("PoisonRecover").field(&"source", &"a guard was explicitly poisoned").finish(),
+            }
         }
     }
+
+    impl<'a, T, Target> fmt::Display for PoisonRecover<'a, T, Target>
+    where
+        Target: ops::DerefMut<Target = Poison<T>>,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self.target.value {
+                Err(PoisonError::Panic(_)) => write!(f, "a guard was poisoned by a panic"),
+                Err(_) => write!(f, "a guard was poisoned by an error"),
+                Ok(_) => write!(f, "a guard was explicitly poisoned"),
+            }
+        }
+    }
+
+    impl<'a, T, Target> Error for PoisonRecover<'a, T, Target>
+    where
+        Target: ops::DerefMut<Target = Poison<T>>,
+    {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            if let Err(ref e) = self.target.value {
+                Some(e)
+            } else {
+                None
+            }
+        }
+    }
+
+    enum PoisonError {
+        Err(Box<dyn Error + Send + Sync>),
+        Panic(Cow<'static, str>),
+        RecoveryFailed,
+    }
+
+    impl PoisonError {
+        fn from_err(err: impl Into<Box<dyn Error + Send + Sync>>) -> Self {
+            PoisonError::Err(err.into())
+        }
+
+        fn from_panic(mut panic: Box<dyn Any + Send>) -> Self {
+            if let Some(panic) = panic.downcast_ref::<&'static str>() {
+                return PoisonError::Panic(Cow::Borrowed(panic));
+            }
+
+            if let Some(panic) = panic.downcast_mut::<String>() {
+                return PoisonError::Panic(Cow::Owned(mem::take(panic)));
+            }
+
+            PoisonError::Panic(Cow::Borrowed("a guard was poisoned by a panic"))
+        }
+
+        fn recovery_failed() -> Self {
+            PoisonError::RecoveryFailed
+        }
+    }
+
+    impl fmt::Debug for PoisonError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                PoisonError::Err(e) => fmt::Debug::fmt(e, f),
+                PoisonError::Panic(panic) => fmt::Debug::fmt(panic, f),
+                PoisonError::RecoveryFailed => fmt::Debug::fmt(&"an attempt to recover the guard failed", f),
+            }
+        }
+    }
+
+    impl fmt::Display for PoisonError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                PoisonError::Err(e) => fmt::Display::fmt(e, f),
+                PoisonError::Panic(panic) => fmt::Display::fmt(panic, f),
+                PoisonError::RecoveryFailed => fmt::Display::fmt(&"an attempt to recover the guard failed", f),
+            }
+        }
+    }
+
+    impl Error for PoisonError { }
 }
 
 #[cfg(test)]
@@ -625,7 +712,7 @@ mod tests {
     mod guard {
         use super::*;
 
-        use std::sync::{Arc, Mutex};
+        use std::{io, sync::{Arc, Mutex}};
 
         struct DropValue(Arc<Mutex<usize>>);
 
@@ -644,8 +731,6 @@ mod tests {
         impl DeadLockOnDrop {
             fn finalize(&mut self) {
                 if !self.finalized {
-                    self.finalized = true;
-
                     match self.lock.clone().try_lock() {
                         Ok(mut guard) => self.finalize_sync(&mut *guard),
                         _ => panic!("deadlock!"),
@@ -780,7 +865,7 @@ mod tests {
             let drop_count = Arc::new(Mutex::new(0));
 
             let p = Poison::try_catch_unwind(|| {
-                let arr: Result<[DropValue; 16], &'static str> = try_init_unwind_safe(
+                let arr: Result<[DropValue; 16], io::Error> = try_init_unwind_safe(
                     0usize,
                     |i, mut uninit| {
                         let arr = uninit.array_mut();
@@ -791,7 +876,7 @@ mod tests {
 
                             *i += 1;
                             if *i == 8 {
-                                return Err("lol");
+                                return Err(io::ErrorKind::Other.into());
                             }
                         }
 
