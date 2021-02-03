@@ -294,7 +294,7 @@ pub mod poison {
     Unwind-safe containers.
     */
 
-    use std::{any::Any, borrow::Cow, error::Error, fmt, mem, ops, panic};
+    use std::{any::Any, borrow::Cow, error::Error, fmt, mem, ops, panic, thread};
 
     /**
     A container that holds a potentially poisoned value.
@@ -303,7 +303,7 @@ pub mod poison {
         // TODO: This could be a `u8` to save space when combining with other flags
         poisoned: bool,
         recover_on_drop: bool,
-        // TODO: Consider a `Result<T, PoisonPayload>`?
+        retain_on_poison: bool,
         value: Result<T, PoisonError>,
     }
 
@@ -315,6 +315,7 @@ pub mod poison {
             Poison {
                 poisoned: false,
                 recover_on_drop: true,
+                retain_on_poison: true,
                 value: Ok(v),
             }
         }
@@ -328,11 +329,13 @@ pub mod poison {
                 Ok(v) => Poison {
                     poisoned: false,
                     recover_on_drop: true,
+                    retain_on_poison: true,
                     value: Ok(v),
                 },
                 Err(panic) => Poison {
                     poisoned: true,
                     recover_on_drop: true,
+                    retain_on_poison: true,
                     value: Err(PoisonError::from_panic(panic)),
                 },
             }
@@ -349,16 +352,19 @@ pub mod poison {
                 Ok(Ok(v)) => Poison {
                     poisoned: false,
                     recover_on_drop: true,
+                    retain_on_poison: true,
                     value: Ok(v),
                 },
                 Ok(Err(e)) => Poison {
                     poisoned: false,
                     recover_on_drop: true,
+                    retain_on_poison: true,
                     value: Err(PoisonError::from_err(e)),
                 },
                 Err(panic) => Poison {
                     poisoned: true,
                     recover_on_drop: true,
+                    retain_on_poison: true,
                     value: Err(PoisonError::from_panic(panic)),
                 },
             }
@@ -401,10 +407,12 @@ pub mod poison {
             } else {
                 target.poisoned = true;
                 let recover_on_drop = target.recover_on_drop;
+                let retain_on_poison = target.retain_on_poison;
 
                 Ok(PoisonGuard {
                     target,
                     recover_on_drop,
+                    retain_on_poison,
                     _marker: Default::default(),
                 })
             }
@@ -420,6 +428,7 @@ pub mod poison {
     {
         target: Target,
         recover_on_drop: bool,
+        retain_on_poison: bool,
         _marker: std::marker::PhantomData<&'a mut T>,
     }
 
@@ -431,6 +440,10 @@ pub mod poison {
         pub fn recover_on_drop(&mut self, recover_on_drop: bool) {
             self.recover_on_drop = recover_on_drop;
         }
+
+        pub fn retain_on_poison(&mut self, retain_on_poison: bool) {
+            self.retain_on_poison = retain_on_poison;
+        }
     }
 
     impl<'a, T, Target> ops::Drop for PoisonGuard<'a, T, Target>
@@ -438,9 +451,15 @@ pub mod poison {
         Target: ops::DerefMut<Target = Poison<T>>,
     {
         fn drop(&mut self) {
-            // TODO: Also check if we're unwinding
-            if self.recover_on_drop {
-                self.target.poisoned = false;
+            if !thread::panicking() {
+                if self.recover_on_drop {
+                    self.target.poisoned = false;
+                }
+            } else if !self.retain_on_poison {
+                drop(mem::replace(
+                    &mut self.target.value,
+                    Err(PoisonError::unknown()),
+                ));
             }
         }
     }
@@ -480,16 +499,62 @@ pub mod poison {
     where
         Target: ops::DerefMut<Target = Poison<T>>,
     {
-        // TODO: Will this always just be the same function if recovery is possible?
+        /**
+        Recover a poisoned value.
+
+        The guard may or may not actually contain a previous value.
+        If it doesn't, the caller will have to produce one to recover with.
+        */
         pub fn recover(mut self, f: impl FnOnce(Option<T>) -> T) -> PoisonGuard<'a, T, Target> {
-            let value = mem::replace(&mut self.target.value, Err(PoisonError::recovery_failed()));
+            let value = mem::replace(&mut self.target.value, Err(PoisonError::unknown()));
 
             self.target.value = Ok(f(value.ok()));
 
+            let recover_on_drop = self.target.recover_on_drop;
+            let retain_on_poison = self.target.retain_on_poison;
+
             PoisonGuard {
                 target: self.target,
-                recover_on_drop: true,
+                recover_on_drop,
+                retain_on_poison,
                 _marker: Default::default(),
+            }
+        }
+
+        /**
+        Try recover a poisoned value.
+
+        The guard may or may not actually contain a previous value.
+        If it doesn't, the caller will have to produce one to recover with.
+        */
+        pub fn try_recover<E>(
+            mut self,
+            f: impl FnOnce(Option<T>) -> Result<T, E>,
+        ) -> Result<PoisonGuard<'a, T, Target>, PoisonRecover<'a, T, Target>>
+        where
+            E: Error + Send + Sync + 'static,
+        {
+            let value = mem::replace(&mut self.target.value, Err(PoisonError::unknown()));
+
+            match f(value.ok()) {
+                Ok(value) => {
+                    self.target.value = Ok(value);
+
+                    let recover_on_drop = self.target.recover_on_drop;
+                    let retain_on_poison = self.target.retain_on_poison;
+
+                    Ok(PoisonGuard {
+                        target: self.target,
+                        recover_on_drop,
+                        retain_on_poison,
+                        _marker: Default::default(),
+                    })
+                }
+                Err(e) => {
+                    self.target.value = Err(PoisonError::from_err(e));
+
+                    Err(self)
+                }
             }
         }
     }
@@ -500,9 +565,15 @@ pub mod poison {
     {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             match self.target.value {
-                Err(PoisonError::Panic(ref panic)) => f.debug_struct("PoisonRecover").field(&"panic", panic).finish(),
+                Err(PoisonError::Panic(ref panic)) => f
+                    .debug_struct("PoisonRecover")
+                    .field(&"panic", panic)
+                    .finish(),
                 Err(ref e) => f.debug_struct("PoisonRecover").field(&"source", e).finish(),
-                Ok(_) => f.debug_struct("PoisonRecover").field(&"source", &"a guard was explicitly poisoned").finish(),
+                Ok(_) => f
+                    .debug_struct("PoisonRecover")
+                    .field(&"source", &"a guard was explicitly poisoned")
+                    .finish(),
             }
         }
     }
@@ -536,7 +607,7 @@ pub mod poison {
     enum PoisonError {
         Err(Box<dyn Error + Send + Sync>),
         Panic(Cow<'static, str>),
-        RecoveryFailed,
+        Unknown,
     }
 
     impl PoisonError {
@@ -556,8 +627,8 @@ pub mod poison {
             PoisonError::Panic(Cow::Borrowed("a guard was poisoned by a panic"))
         }
 
-        fn recovery_failed() -> Self {
-            PoisonError::RecoveryFailed
+        fn unknown() -> Self {
+            PoisonError::Unknown
         }
     }
 
@@ -566,7 +637,7 @@ pub mod poison {
             match self {
                 PoisonError::Err(e) => fmt::Debug::fmt(e, f),
                 PoisonError::Panic(panic) => fmt::Debug::fmt(panic, f),
-                PoisonError::RecoveryFailed => fmt::Debug::fmt(&"an attempt to recover the guard failed", f),
+                PoisonError::Unknown => fmt::Debug::fmt(&"a guard was poisoned", f),
             }
         }
     }
@@ -576,21 +647,21 @@ pub mod poison {
             match self {
                 PoisonError::Err(e) => fmt::Display::fmt(e, f),
                 PoisonError::Panic(panic) => fmt::Display::fmt(panic, f),
-                PoisonError::RecoveryFailed => fmt::Display::fmt(&"an attempt to recover the guard failed", f),
+                PoisonError::Unknown => fmt::Display::fmt(&"a guard was poisoned", f),
             }
         }
     }
 
-    impl Error for PoisonError { }
+    impl Error for PoisonError {}
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{guard::*, poison::*};
-    use std::{mem, ops, ptr};
+    use std::{io, mem, ops, panic, ptr};
 
     #[test]
-    fn it_works() {
+    fn unpoisoned_guard_can_access_value() {
         let mut v = Poison::new(42);
 
         let mut guard = v.poison().unwrap();
@@ -601,12 +672,11 @@ mod tests {
 
         // Dropping a guard shouldn't poison
         assert!(!v.is_poisoned());
+    }
 
-        let guard = v.poison().unwrap();
-
-        // The updated value should remain
-        assert_eq!(43, *guard);
-        drop(guard);
+    #[test]
+    fn guard_recover() {
+        let mut v = Poison::new(43);
 
         // Poison the guard by forgetting it without dropping
         std::mem::forget(v.poison().unwrap());
@@ -623,8 +693,44 @@ mod tests {
     }
 
     #[test]
+    fn guard_try_recover() {
+        let mut v = Poison::new(43);
+
+        // Poison the guard by forgetting it without dropping
+        std::mem::forget(v.poison().unwrap());
+        assert!(v.is_poisoned());
+
+        // Unpoison the guard and decrement the value back down
+        let guard = v
+            .poison()
+            .or_else(|guard| guard.try_recover(|_| Ok::<i32, io::Error>(42)))
+            .unwrap();
+
+        assert_eq!(42, *guard);
+        drop(guard);
+
+        // The value should no longer be poisoned
+        assert!(!v.is_poisoned());
+    }
+
+    #[test]
     fn catch_unwind_produces_poisoned_guard() {
         let v = Poison::catch_unwind(|| panic!("lol"));
+
+        assert!(v.is_poisoned());
+    }
+
+    #[test]
+    fn guard_poisons_on_panic() {
+        let mut v = Poison::new(42);
+
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let mut guard = v.poison().unwrap();
+
+            *guard += 1;
+
+            panic!("lol");
+        }));
 
         assert!(v.is_poisoned());
     }
@@ -712,7 +818,10 @@ mod tests {
     mod guard {
         use super::*;
 
-        use std::{io, sync::{Arc, Mutex}};
+        use std::{
+            io,
+            sync::{Arc, Mutex},
+        };
 
         struct DropValue(Arc<Mutex<usize>>);
 
