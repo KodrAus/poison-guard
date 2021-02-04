@@ -1,5 +1,5 @@
 // TODO: Get consistent with terminology: unwind vs panic
-#![feature(backtrace)]
+#![feature(backtrace, once_cell)]
 
 // NOTE: Could be `no_std`.
 pub mod guard {
@@ -368,6 +368,15 @@ pub mod poison {
         }
 
         /**
+        Try get the inner value.
+
+        This will return `None` if the value is poisoned.
+        */
+        pub fn get(&self) -> Option<&T> {
+            (!self.is_poisoned()).then(|| &self.value)
+        }
+
+        /**
         Try poison the value and return a guard to it.
 
         If the guard is dropped normally the value will be unpoisoned.
@@ -434,13 +443,13 @@ pub mod poison {
     {
         #[track_caller]
         fn drop(&mut self) {
-            if thread::panicking() {
-                self.target.poisoned = Some(PoisonError::from_panic());
-            } else if self.recover_on_drop {
-                self.target.poisoned = None;
+            self.target.poisoned = if thread::panicking() {
+                Some(PoisonError::from_panic())
+            } else if !self.recover_on_drop {
+                Some(PoisonError::from_err())
             } else {
-                self.target.poisoned = Some(PoisonError::from_err());
-            }
+                None
+            };
         }
     }
 
@@ -590,7 +599,6 @@ pub mod poison {
             }
         }
 
-        #[track_caller]
         fn sentinel() -> Self {
             PoisonError { backtrace: Backtrace::disabled() }
         }
@@ -694,6 +702,30 @@ mod tests {
         }));
 
         assert!(v.is_poisoned());
+    }
+
+    mod lazy {
+        use super::*;
+
+        use std::lazy::SyncLazy as Lazy;
+
+        #[test]
+        fn poisoning_lazy_ok() {
+            static LAZY: Lazy<Poison<i32>> = Lazy::new(|| Poison::catch_unwind(|| {
+                42
+            }));
+
+            assert_eq!(42, *LAZY.get().unwrap());
+        }
+
+        #[test]
+        fn poisoning_lazy_panic() {
+            static LAZY: Lazy<Poison<i32>> = Lazy::new(|| Poison::catch_unwind(|| {
+                panic!("lol")
+            }));
+
+            assert!(LAZY.is_poisoned());
+        }
     }
 
     mod mutex {
