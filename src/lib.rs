@@ -771,6 +771,11 @@ mod tests {
     use std::{error::Error, io, mem, ops, panic, ptr};
 
     #[test]
+    fn poison_size() {
+        assert!(mem::size_of::<Poison<()>>() <= (mem::size_of::<usize>() * 2));
+    }
+
+    #[test]
     fn unpoisoned_guard_can_access_value() {
         let mut v = Poison::new(42);
 
