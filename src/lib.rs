@@ -302,7 +302,10 @@ pub mod poison {
     Unwind-safe containers.
     */
 
-    use std::{any::Any, borrow::Cow, backtrace::Backtrace, error::Error, fmt, ops, mem, panic, thread};
+    use std::{
+        any::Any, backtrace::Backtrace, borrow::Cow, error::Error, fmt, mem, ops, panic, sync::Arc,
+        thread,
+    };
 
     /**
     A container that holds a potentially poisoned value.
@@ -585,28 +588,53 @@ pub mod poison {
         }
     }
 
-    impl<'a, T, Target> Error for PoisonRecover<'a, T, Target>
+    impl<'a, T, Target> AsRef<dyn Error + Send + Sync + 'static> for PoisonRecover<'a, T, Target>
     where
         Target: ops::DerefMut<Target = Poison<T>>,
     {
-        fn source(&self) -> Option<&(dyn Error + 'static)> {
-            if let Some(ref e) = self.target.poisoned {
-                Some(e)
-            } else {
-                None
-            }
+        fn as_ref(&self) -> &(dyn Error + Send + Sync + 'static) {
+            self.target.poisoned.as_ref().unwrap()
         }
     }
 
-    #[derive(Debug)]
+    // TODO: Do we want to return a concrete error type here?
+    impl<'a, T, Target> From<PoisonRecover<'a, T, Target>> for Box<dyn Error + 'static>
+    where
+        Target: ops::DerefMut<Target = Poison<T>>,
+    {
+        fn from(guard: PoisonRecover<'a, T, Target>) -> Self {
+            Box::new(guard.target.poisoned.as_ref().unwrap().clone())
+        }
+    }
+
+    impl<'a, T, Target> From<PoisonRecover<'a, T, Target>> for Box<dyn Error + Send + 'static>
+    where
+        Target: ops::DerefMut<Target = Poison<T>>,
+    {
+        fn from(guard: PoisonRecover<'a, T, Target>) -> Self {
+            Box::new(guard.target.poisoned.as_ref().unwrap().clone())
+        }
+    }
+
+    impl<'a, T, Target> From<PoisonRecover<'a, T, Target>> for Box<dyn Error + Send + Sync + 'static>
+    where
+        Target: ops::DerefMut<Target = Poison<T>>,
+    {
+        fn from(guard: PoisonRecover<'a, T, Target>) -> Self {
+            Box::new(guard.target.poisoned.as_ref().unwrap().clone())
+        }
+    }
+
+    // TODO: Optimize this better
+    #[derive(Debug, Clone)]
     enum PoisonSource {
         Panic {
             panic: Option<Cow<'static, str>>,
-            backtrace: Backtrace,
+            backtrace: Arc<Backtrace>,
         },
         Err {
-            source: Option<Box<dyn Error + Send + Sync>>,
-            backtrace: Backtrace,
+            source: Option<Arc<dyn Error + Send + Sync>>,
+            backtrace: Arc<Backtrace>,
         },
         Sentinel,
     }
@@ -615,22 +643,22 @@ pub mod poison {
         #[track_caller]
         fn from_err(err: Option<Box<dyn Error + Send + Sync>>) -> Self {
             PoisonSource::Err {
-                backtrace: Backtrace::capture(),
-                source: err,
+                backtrace: Arc::new(Backtrace::capture()),
+                source: err.map(|err| err.into()),
             }
         }
 
         #[track_caller]
         fn from_panic(panic: Option<Box<dyn Any + Send>>) -> Self {
             PoisonSource::Panic {
-                backtrace: Backtrace::capture(),
+                backtrace: Arc::new(Backtrace::capture()),
                 panic: panic.and_then(|mut panic| {
                     if let Some(msg) = panic.downcast_ref::<&'static str>() {
-                        return Some(Cow::Borrowed(*msg))
+                        return Some(Cow::Borrowed(*msg));
                     }
 
                     if let Some(msg) = panic.downcast_mut::<String>() {
-                        return Some(Cow::Owned(mem::take(&mut *msg)))
+                        return Some(Cow::Owned(mem::take(&mut *msg)));
                     }
 
                     None
@@ -651,7 +679,11 @@ pub mod poison {
 
     impl Error for PoisonSource {
         fn source(&self) -> Option<&(dyn Error + 'static)> {
-            if let PoisonSource::Err { source: Some(ref source), .. } = self {
+            if let PoisonSource::Err {
+                source: Some(ref source),
+                ..
+            } = self
+            {
                 Some(&**source)
             } else {
                 None
@@ -671,7 +703,7 @@ pub mod poison {
 #[cfg(test)]
 mod tests {
     use crate::{guard::*, poison::*};
-    use std::{io, mem, ops, panic, ptr};
+    use std::{error::Error, io, mem, ops, panic, ptr};
 
     #[test]
     fn unpoisoned_guard_can_access_value() {
@@ -767,6 +799,20 @@ mod tests {
         let _ = v.poison().unwrap();
     }
 
+    #[test]
+    fn convert_poisoned_guard_into_error() {
+        fn try_with(v: &mut Poison<i32>) -> Result<(), Box<dyn Error + 'static>> {
+            let guard = v.poison()?;
+
+            assert_eq!(42, *guard);
+
+            Ok(())
+        }
+
+        assert!(try_with(&mut Poison::new(42)).is_ok());
+        assert!(try_with(&mut Poison::catch_unwind(|| panic!("lol"))).is_err());
+    }
+
     mod lazy {
         use super::*;
 
@@ -774,18 +820,14 @@ mod tests {
 
         #[test]
         fn poisoning_lazy_ok() {
-            static LAZY: Lazy<Poison<i32>> = Lazy::new(|| Poison::catch_unwind(|| {
-                42
-            }));
+            static LAZY: Lazy<Poison<i32>> = Lazy::new(|| Poison::catch_unwind(|| 42));
 
             assert_eq!(42, *LAZY.get().unwrap());
         }
 
         #[test]
         fn poisoning_lazy_panic() {
-            static LAZY: Lazy<Poison<i32>> = Lazy::new(|| Poison::catch_unwind(|| {
-                panic!("lol")
-            }));
+            static LAZY: Lazy<Poison<i32>> = Lazy::new(|| Poison::catch_unwind(|| panic!("lol")));
 
             assert!(LAZY.is_poisoned());
         }
