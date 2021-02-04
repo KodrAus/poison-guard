@@ -312,7 +312,7 @@ pub mod poison {
     */
     pub struct Poison<T> {
         value: T,
-        poisoned: Option<PoisonSource>,
+        poisoned: PoisonState,
     }
 
     impl<T> Poison<T> {
@@ -322,7 +322,7 @@ pub mod poison {
         pub fn new(v: T) -> Self {
             Poison {
                 value: v,
-                poisoned: None,
+                poisoned: PoisonState::unpoisoned(),
             }
         }
 
@@ -340,11 +340,11 @@ pub mod poison {
             match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
                 Ok(v) => Poison {
                     value: v,
-                    poisoned: None,
+                    poisoned: PoisonState::unpoisoned(),
                 },
                 Err(panic) => Poison {
                     value: Default::default(),
-                    poisoned: Some(PoisonSource::from_panic(Some(panic))),
+                    poisoned: PoisonState::from_panic(Some(panic)),
                 },
             }
         }
@@ -363,15 +363,15 @@ pub mod poison {
             match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
                 Ok(Ok(v)) => Poison {
                     value: v,
-                    poisoned: None,
+                    poisoned: PoisonState::unpoisoned(),
                 },
                 Ok(Err(e)) => Poison {
                     value: Default::default(),
-                    poisoned: Some(PoisonSource::from_err(Some(Box::new(e)))),
+                    poisoned: PoisonState::from_err(Some(Box::new(e))),
                 },
                 Err(panic) => Poison {
                     value: Default::default(),
-                    poisoned: Some(PoisonSource::from_panic(Some(panic))),
+                    poisoned: PoisonState::from_panic(Some(panic)),
                 },
             }
         }
@@ -380,7 +380,7 @@ pub mod poison {
         Whether or not the `Poison<T>` is actually poisoned.
         */
         pub fn is_poisoned(&self) -> bool {
-            self.poisoned.is_some()
+            self.poisoned.is_poisoned()
         }
 
         /**
@@ -389,8 +389,8 @@ pub mod poison {
         This will return `Err` if the value is poisoned.
         */
         pub fn get(&self) -> Result<&T, &(dyn Error + 'static)> {
-            if let Some(err) = &self.poisoned {
-                Err(err)
+            if let PoisonState::Err(ref err) = self.poisoned {
+                Err(&*err.source)
             } else {
                 Ok(&self.value)
             }
@@ -426,7 +426,7 @@ pub mod poison {
                     _marker: Default::default(),
                 })
             } else {
-                target.poisoned = Some(PoisonSource::sentinel());
+                target.poisoned = PoisonState::sentinel();
 
                 Ok(PoisonGuard {
                     target,
@@ -466,12 +466,24 @@ pub mod poison {
         #[track_caller]
         fn drop(&mut self) {
             self.target.poisoned = if thread::panicking() {
-                Some(PoisonSource::from_panic(None))
+                PoisonState::from_panic(None)
             } else if !self.recover_on_drop {
-                Some(PoisonSource::from_err(None))
+                PoisonState::from_err(None)
             } else {
-                None
+                PoisonState::unpoisoned()
             };
+        }
+    }
+
+    impl<'a, T, Target> fmt::Debug for PoisonGuard<'a, T, Target>
+    where
+        T: fmt::Debug,
+        Target: ops::DerefMut<Target = Poison<T>>,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.debug_struct("PoisonGuard")
+                .field(&"value", &self.target.value)
+                .finish()
         }
     }
 
@@ -519,7 +531,7 @@ pub mod poison {
         #[track_caller]
         pub fn recover(mut self, f: impl FnOnce(&mut T)) -> PoisonGuard<'a, T, Target> {
             f(&mut self.target.value);
-            self.target.poisoned = None;
+            self.target.poisoned = PoisonState::unpoisoned();
 
             PoisonGuard {
                 target: self.target,
@@ -544,7 +556,7 @@ pub mod poison {
         {
             match f(&mut self.target.value) {
                 Ok(()) => {
-                    self.target.poisoned = None;
+                    self.target.poisoned = PoisonState::unpoisoned();
 
                     Ok(PoisonGuard {
                         target: self.target,
@@ -553,7 +565,7 @@ pub mod poison {
                     })
                 }
                 Err(e) => {
-                    self.target.poisoned = Some(PoisonSource::from_err(Some(Box::new(e))));
+                    self.target.poisoned = PoisonState::from_err(Some(Box::new(e)));
 
                     Err(self)
                 }
@@ -566,13 +578,9 @@ pub mod poison {
         Target: ops::DerefMut<Target = Poison<T>>,
     {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            match self.target.poisoned {
-                Some(ref e) => f.debug_struct("PoisonRecover").field(&"source", e).finish(),
-                None => f
-                    .debug_struct("PoisonRecover")
-                    .field(&"source", &"a guard was explicitly poisoned")
-                    .finish(),
-            }
+            f.debug_struct("PoisonRecover")
+                .field(&"source", &self.target.poisoned)
+                .finish()
         }
     }
 
@@ -581,10 +589,7 @@ pub mod poison {
         Target: ops::DerefMut<Target = Poison<T>>,
     {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            match self.target.poisoned {
-                Some(_) => write!(f, "a guard was poisoned by an error or panic"),
-                None => write!(f, "a guard was explicitly poisoned"),
-            }
+            fmt::Display::fmt(&self.target.poisoned, f)
         }
     }
 
@@ -593,7 +598,7 @@ pub mod poison {
         Target: ops::DerefMut<Target = Poison<T>>,
     {
         fn as_ref(&self) -> &(dyn Error + Send + Sync + 'static) {
-            self.target.poisoned.as_ref().unwrap()
+            &self.target.poisoned
         }
     }
 
@@ -603,7 +608,7 @@ pub mod poison {
         Target: ops::DerefMut<Target = Poison<T>>,
     {
         fn from(guard: PoisonRecover<'a, T, Target>) -> Self {
-            Box::new(guard.target.poisoned.as_ref().unwrap().clone())
+            Box::new(guard.target.poisoned.clone())
         }
     }
 
@@ -612,7 +617,7 @@ pub mod poison {
         Target: ops::DerefMut<Target = Poison<T>>,
     {
         fn from(guard: PoisonRecover<'a, T, Target>) -> Self {
-            Box::new(guard.target.poisoned.as_ref().unwrap().clone())
+            Box::new(guard.target.poisoned.clone())
         }
     }
 
@@ -621,70 +626,128 @@ pub mod poison {
         Target: ops::DerefMut<Target = Poison<T>>,
     {
         fn from(guard: PoisonRecover<'a, T, Target>) -> Self {
-            Box::new(guard.target.poisoned.as_ref().unwrap().clone())
+            Box::new(guard.target.poisoned.clone())
         }
     }
 
-    // TODO: Optimize this better
-    #[derive(Debug, Clone)]
-    enum PoisonSource {
-        Panic {
-            panic: Option<Cow<'static, str>>,
-            backtrace: Arc<Backtrace>,
-        },
-        Err {
-            source: Option<Arc<dyn Error + Send + Sync>>,
-            backtrace: Arc<Backtrace>,
-        },
+    #[derive(Clone)]
+    enum PoisonState {
+        Panic(Arc<PoisonStatePanic>),
+        Err(Arc<PoisonStateErr>),
+        UnknownPanic(Arc<Backtrace>),
+        UnknownErr(Arc<Backtrace>),
         Sentinel,
+        Unpoisoned,
     }
 
-    impl PoisonSource {
+    struct PoisonStatePanic {
+        backtrace: Backtrace,
+        payload: Cow<'static, str>,
+    }
+
+    struct PoisonStateErr {
+        backtrace: Backtrace,
+        source: Box<dyn Error + Send + Sync>,
+    }
+
+    impl PoisonState {
         #[track_caller]
         fn from_err(err: Option<Box<dyn Error + Send + Sync>>) -> Self {
-            PoisonSource::Err {
-                backtrace: Arc::new(Backtrace::capture()),
-                source: err.map(|err| err.into()),
+            if let Some(err) = err {
+                PoisonState::Err(Arc::new(PoisonStateErr {
+                    backtrace: Backtrace::capture(),
+                    source: err,
+                }))
+            } else {
+                PoisonState::UnknownErr(Arc::new(Backtrace::capture()))
             }
         }
 
         #[track_caller]
         fn from_panic(panic: Option<Box<dyn Any + Send>>) -> Self {
-            PoisonSource::Panic {
-                backtrace: Arc::new(Backtrace::capture()),
-                panic: panic.and_then(|mut panic| {
-                    if let Some(msg) = panic.downcast_ref::<&'static str>() {
-                        return Some(Cow::Borrowed(*msg));
-                    }
+            let panic = panic.and_then(|mut panic| {
+                if let Some(msg) = panic.downcast_ref::<&'static str>() {
+                    return Some(Cow::Borrowed(*msg));
+                }
 
-                    if let Some(msg) = panic.downcast_mut::<String>() {
-                        return Some(Cow::Owned(mem::take(&mut *msg)));
-                    }
+                if let Some(msg) = panic.downcast_mut::<String>() {
+                    return Some(Cow::Owned(mem::take(&mut *msg)));
+                }
 
-                    None
-                }),
+                None
+            });
+
+            if let Some(panic) = panic {
+                PoisonState::Panic(Arc::new(PoisonStatePanic {
+                    backtrace: Backtrace::capture(),
+                    payload: panic,
+                }))
+            } else {
+                PoisonState::UnknownPanic(Arc::new(Backtrace::capture()))
             }
         }
 
+        fn unpoisoned() -> Self {
+            PoisonState::Unpoisoned
+        }
+
         fn sentinel() -> Self {
-            PoisonSource::Sentinel
+            PoisonState::Sentinel
+        }
+
+        fn is_poisoned(&self) -> bool {
+            !matches!(self, PoisonState::Unpoisoned)
         }
     }
 
-    impl fmt::Display for PoisonSource {
+    impl fmt::Debug for PoisonState {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            fmt::Display::fmt(&"a guard was poisoned", f)
+            match self {
+                PoisonState::Panic(panic) => f
+                    .debug_struct("PoisonState")
+                    .field(&"panic", &panic.payload)
+                    .field(&"backtrace", &panic.backtrace)
+                    .finish(),
+                PoisonState::UnknownPanic(backtrace) => f
+                    .debug_struct("PoisonState")
+                    .field(&"panic", &"<unknown>")
+                    .field(&"backtrace", &backtrace)
+                    .finish(),
+                PoisonState::Err(err) => f
+                    .debug_struct("PoisonState")
+                    .field(&"err", &err.source)
+                    .field(&"backtrace", &err.backtrace)
+                    .finish(),
+                PoisonState::UnknownErr(backtrace) => f
+                    .debug_struct("PoisonState")
+                    .field(&"err", &"<unknown>")
+                    .field(&"backtrace", &backtrace)
+                    .finish(),
+                PoisonState::Sentinel => f.debug_struct("PoisonState").finish(),
+                PoisonState::Unpoisoned => f.debug_struct("PoisonState").finish(),
+            }
         }
     }
 
-    impl Error for PoisonSource {
+    impl fmt::Display for PoisonState {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                PoisonState::Panic(panic) => {
+                    write!(f, "a guard was poisoned by a panic at '{}'", panic.payload)
+                }
+                PoisonState::UnknownPanic(_) => write!(f, "a guard was poisoned by a panic"),
+                PoisonState::Err(_) => write!(f, "a guard was poisoned by an error"),
+                PoisonState::UnknownErr(_) => write!(f, "a guard was poisoned by an error"),
+                PoisonState::Sentinel => write!(f, "a guard was poisoned"),
+                PoisonState::Unpoisoned => write!(f, "a guard was not poisoned"),
+            }
+        }
+    }
+
+    impl Error for PoisonState {
         fn source(&self) -> Option<&(dyn Error + 'static)> {
-            if let PoisonSource::Err {
-                source: Some(ref source),
-                ..
-            } = self
-            {
-                Some(&**source)
+            if let PoisonState::Err(ref err) = self {
+                Some(&*err.source)
             } else {
                 None
             }
@@ -692,9 +755,11 @@ pub mod poison {
 
         fn backtrace(&self) -> Option<&Backtrace> {
             match self {
-                PoisonSource::Err { ref backtrace, .. } => Some(backtrace),
-                PoisonSource::Panic { ref backtrace, .. } => Some(backtrace),
-                PoisonSource::Sentinel => None,
+                PoisonState::Err(ref err) => Some(&err.backtrace),
+                PoisonState::Panic(ref panic) => Some(&panic.backtrace),
+                PoisonState::UnknownErr(ref backtrace) => Some(&**backtrace),
+                PoisonState::UnknownPanic(ref backtrace) => Some(&**backtrace),
+                _ => None,
             }
         }
     }
