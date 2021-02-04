@@ -1,4 +1,3 @@
-// TODO: Get consistent with terminology: unwind vs panic
 #![feature(backtrace, once_cell)]
 
 // NOTE: Could be `no_std`.
@@ -11,12 +10,12 @@ pub mod guard {
     Absolutely not, where did you learn such words?
     Once an exception has been caught, `catch` gives you tools to determine how its propagated.
     You may choose to ignore, rethrow, or repackage it.
-    These functions don't let you catch a panic that occurs, just run some extra code along the way.
+    These functions don't let you catch an unwind that occurs, just run some extra code along the way.
 
     ## Is this just `try`/`finally` then?
 
     That's a little closer, but still not quite there.
-    A `finally` block executes on both normal and exceptional paths, where the unwind closures here only execute after a panic.
+    A `finally` block executes on both normal and exceptional paths, where the unwind closures here only execute after an unwind.
     */
 
     use std::{
@@ -26,10 +25,10 @@ pub mod guard {
     };
 
     /**
-    Attempt to initialize a value that may panic.
+    Attempt to initialize a value that may unwind.
 
     The initialization function will be called to produce a value, `T`, from a `MaybeUninit<T>`.
-    If the initialization function panics, then the unwind function will be called.
+    If the initialization function unwinds, then the unwind function will be called.
     This gives the caller a chance to clean up any partially initialized state and avoid leaks.
 
     The state value is shared between initialization and unwinding so it can be used to determine
@@ -58,6 +57,8 @@ pub mod guard {
 
         // Run the initialization function
         let init = init(
+            // SAFETY: These exclusive accesses to the inner value and state doesn't overlap a borrow given to the unwind closure
+            // These borrows expire _before_ the unwind closure gets a chance to run
             unsafe { &mut *state.get() },
             MaybeUninitSlot(unsafe { &mut *uninit.get() }),
         );
@@ -84,10 +85,10 @@ pub mod guard {
     }
 
     /**
-    Attempt to initialize a value that may fail or panic.
+    Attempt to initialize a value that may fail or unwind.
 
     The initialization function will be called to try produce a value, `T`, from a `MaybeUninit<T>`.
-    If the initialization function fails or panics, then the unwind function will be called.
+    If the initialization function fails or unwinds, then the unwind function will be called.
     This gives the caller a chance to clean up any partially initialized state and avoid leaks.
 
     The state value is shared between initialization and unwinding so it can be used to determine
@@ -116,6 +117,8 @@ pub mod guard {
 
         // Run the initialization function
         match try_init(
+            // SAFETY: These exclusive accesses to the inner value and state doesn't overlap a borrow given to the unwind closure
+            // These borrows expire _before_ the unwind closure gets a chance to run
             unsafe { &mut *state.get() },
             MaybeUninitSlot(unsafe { &mut *uninit.get() }),
         ) {
@@ -177,12 +180,14 @@ pub mod guard {
         type Target = T;
 
         fn deref(&self) -> &T {
+            // SAFETY: An `InitSlot` can only be created from an initialized value
             unsafe { &*self.0.get().as_ptr() }
         }
     }
 
     impl<'a, T> ops::DerefMut for InitSlot<'a, T> {
         fn deref_mut(&mut self) -> &mut T {
+            // SAFETY: An `InitSlot` can only be created from an initialized value
             unsafe { &mut *self.0.get_mut().as_mut_ptr() }
         }
     }
@@ -224,6 +229,7 @@ pub mod guard {
         Get a reference to the value to initialize as an array.
         */
         pub fn array_mut(&mut self) -> &mut [MaybeUninit<T>; N] {
+            // SAFETY: `MaybeUninit<T>` has the same layout as `T`
             unsafe {
                 mem::transmute::<&mut mem::MaybeUninit<[T; N]>, &mut [mem::MaybeUninit<T>; N]>(
                     self.get_mut(),
@@ -254,6 +260,7 @@ pub mod guard {
         Take the partially initialized value as an array.
         */
         pub fn into_array(mut self) -> [MaybeUninit<T>; N] {
+            // SAFETY: `MaybeUninit<T>` has the same layout as `T`
             unsafe {
                 ptr::read(
                     &mut self.0 as *mut mem::MaybeUninit<[T; N]> as *mut [mem::MaybeUninit<T>; N],
@@ -317,7 +324,10 @@ pub mod poison {
         }
 
         /**
-        Try create a new `Poison<T>` with an initialization function that may panic.
+        Try create a new `Poison<T>` with an initialization function that may unwind.
+
+        If initialization does unwind then the panic payload will be caught and stashed inside the `Poison<T>`.
+        Any attempt to access the poisoned value will instead return this payload unless the `Poison<T>` is restored.
         */
         pub fn catch_unwind(f: impl FnOnce() -> T) -> Self
         where
@@ -337,7 +347,10 @@ pub mod poison {
         }
 
         /**
-        Try create a new `Poison<T>` with an initialization function that may fail or panic.
+        Try create a new `Poison<T>` with an initialization function that may fail or unwind.
+
+        If initialization does unwind then the error or panic payload will be caught and stashed inside the `Poison<T>`.
+        Any attempt to access the poisoned value will instead return this payload unless the `Poison<T>` is restored.
         */
         pub fn try_catch_unwind<E>(f: impl FnOnce() -> Result<T, E>) -> Self
         where
@@ -370,10 +383,14 @@ pub mod poison {
         /**
         Try get the inner value.
 
-        This will return `None` if the value is poisoned.
+        This will return `Err` if the value is poisoned.
         */
-        pub fn get(&self) -> Option<&T> {
-            (!self.is_poisoned()).then(|| &self.value)
+        pub fn get(&self) -> Result<&T, &(dyn Error + 'static)> {
+            if let Some(err) = &self.poisoned {
+                Err(err)
+            } else {
+                Ok(&self.value)
+            }
         }
 
         /**
