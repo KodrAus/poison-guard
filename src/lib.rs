@@ -295,14 +295,14 @@ pub mod poison {
     Unwind-safe containers.
     */
 
-    use std::{backtrace::Backtrace, error::Error, fmt, ops, panic, thread};
+    use std::{any::Any, borrow::Cow, backtrace::Backtrace, error::Error, fmt, ops, mem, panic, thread};
 
     /**
     A container that holds a potentially poisoned value.
     */
     pub struct Poison<T> {
         value: T,
-        poisoned: Option<PoisonError>,
+        poisoned: Option<PoisonSource>,
     }
 
     impl<T> Poison<T> {
@@ -329,9 +329,9 @@ pub mod poison {
                     value: v,
                     poisoned: None,
                 },
-                Err(_) => Poison {
+                Err(panic) => Poison {
                     value: Default::default(),
-                    poisoned: Some(PoisonError::from_panic()),
+                    poisoned: Some(PoisonSource::from_panic(Some(panic))),
                 },
             }
         }
@@ -349,13 +349,13 @@ pub mod poison {
                     value: v,
                     poisoned: None,
                 },
-                Ok(Err(_)) => Poison {
+                Ok(Err(e)) => Poison {
                     value: Default::default(),
-                    poisoned: Some(PoisonError::from_err()),
+                    poisoned: Some(PoisonSource::from_err(Some(Box::new(e)))),
                 },
-                Err(_) => Poison {
+                Err(panic) => Poison {
                     value: Default::default(),
-                    poisoned: Some(PoisonError::from_panic()),
+                    poisoned: Some(PoisonSource::from_panic(Some(panic))),
                 },
             }
         }
@@ -388,6 +388,8 @@ pub mod poison {
 
         // NOTE: We can *almost* use arbitrary self types here (at least while they still work on inherent methods)
         // but can't because it breaks auto-ref
+        // NOTE: This lets us do something like wrap a guard internally without having to deal with mutable references.
+        // NOTE: An alternative to this could be scoped poisoning in closures. These aren't always easy to work with though.
         /**
         Try poison the value contained behind some target reference and return a guard to it.
         */
@@ -404,7 +406,7 @@ pub mod poison {
                     _marker: Default::default(),
                 })
             } else {
-                target.poisoned = Some(PoisonError::sentinel());
+                target.poisoned = Some(PoisonSource::sentinel());
 
                 Ok(PoisonGuard {
                     target,
@@ -432,8 +434,8 @@ pub mod poison {
         Target: ops::DerefMut<Target = Poison<T>>,
     {
         // TODO: Call this something more semantic? `poison_on_early_return`? `enter`/`exit`?
-        pub fn recover_on_drop(&mut self, recover_on_drop: bool) {
-            self.recover_on_drop = recover_on_drop;
+        pub fn recover_on_drop(guard: &mut Self, recover_on_drop: bool) {
+            guard.recover_on_drop = recover_on_drop;
         }
     }
 
@@ -444,9 +446,9 @@ pub mod poison {
         #[track_caller]
         fn drop(&mut self) {
             self.target.poisoned = if thread::panicking() {
-                Some(PoisonError::from_panic())
+                Some(PoisonSource::from_panic(None))
             } else if !self.recover_on_drop {
-                Some(PoisonError::from_err())
+                Some(PoisonSource::from_err(None))
             } else {
                 None
             };
@@ -530,8 +532,8 @@ pub mod poison {
                         _marker: Default::default(),
                     })
                 }
-                Err(_) => {
-                    self.target.poisoned = Some(PoisonError::from_err());
+                Err(e) => {
+                    self.target.poisoned = Some(PoisonSource::from_err(Some(Box::new(e))));
 
                     Err(self)
                 }
@@ -580,39 +582,71 @@ pub mod poison {
     }
 
     #[derive(Debug)]
-    struct PoisonError {
-        backtrace: Backtrace,
+    enum PoisonSource {
+        Panic {
+            panic: Option<Cow<'static, str>>,
+            backtrace: Backtrace,
+        },
+        Err {
+            source: Option<Box<dyn Error + Send + Sync>>,
+            backtrace: Backtrace,
+        },
+        Sentinel,
     }
 
-    impl PoisonError {
+    impl PoisonSource {
         #[track_caller]
-        fn from_err() -> Self {
-            PoisonError {
+        fn from_err(err: Option<Box<dyn Error + Send + Sync>>) -> Self {
+            PoisonSource::Err {
                 backtrace: Backtrace::capture(),
+                source: err,
             }
         }
 
         #[track_caller]
-        fn from_panic() -> Self {
-            PoisonError {
+        fn from_panic(panic: Option<Box<dyn Any + Send>>) -> Self {
+            PoisonSource::Panic {
                 backtrace: Backtrace::capture(),
+                panic: panic.and_then(|mut panic| {
+                    if let Some(msg) = panic.downcast_ref::<&'static str>() {
+                        return Some(Cow::Borrowed(*msg))
+                    }
+
+                    if let Some(msg) = panic.downcast_mut::<String>() {
+                        return Some(Cow::Owned(mem::take(&mut *msg)))
+                    }
+
+                    None
+                }),
             }
         }
 
         fn sentinel() -> Self {
-            PoisonError { backtrace: Backtrace::disabled() }
+            PoisonSource::Sentinel
         }
     }
 
-    impl fmt::Display for PoisonError {
+    impl fmt::Display for PoisonSource {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             fmt::Display::fmt(&"a guard was poisoned", f)
         }
     }
 
-    impl Error for PoisonError {
+    impl Error for PoisonSource {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            if let PoisonSource::Err { source: Some(ref source), .. } = self {
+                Some(&**source)
+            } else {
+                None
+            }
+        }
+
         fn backtrace(&self) -> Option<&Backtrace> {
-            Some(&self.backtrace)
+            match self {
+                PoisonSource::Err { ref backtrace, .. } => Some(backtrace),
+                PoisonSource::Panic { ref backtrace, .. } => Some(backtrace),
+                PoisonSource::Sentinel => None,
+            }
         }
     }
 }
@@ -702,6 +736,18 @@ mod tests {
         }));
 
         assert!(v.is_poisoned());
+    }
+
+    #[test]
+    fn catch_unwind_poison() {
+        let mut v = Poison::catch_unwind(|| panic!("lol"));
+        let _ = v.poison().unwrap();
+    }
+
+    #[test]
+    fn try_catch_unwind_err() {
+        let mut v = Poison::try_catch_unwind(|| Err::<(), io::Error>(io::ErrorKind::Other.into()));
+        let _ = v.poison().unwrap();
     }
 
     mod lazy {
@@ -798,7 +844,7 @@ mod tests {
 
             // Poison the guard without deadlocking the mutex
             let mut v = mutex.lock().poison().unwrap();
-            v.recover_on_drop(false);
+            PoisonGuard::recover_on_drop(&mut v, false);
             drop(v);
 
             let guard = mutex
@@ -883,21 +929,17 @@ mod tests {
             let arr: [u8; 16] = init_unwind_safe(
                 0usize,
                 |i, mut uninit| {
-                    let arr = uninit.array_mut();
-
-                    while *i < 16 {
-                        arr[*i] = mem::MaybeUninit::new(*i as u8);
+                    for elem in uninit.array_mut() {
+                        *elem = mem::MaybeUninit::new(*i as u8);
                         *i += 1;
                     }
 
                     unsafe { uninit.assume_init() }
                 },
                 |i, unwound| {
-                    let mut arr = unwound.into_array();
-
-                    for i in 0..*i {
+                    for elem in &mut unwound.into_array()[0..*i] {
                         unsafe {
-                            ptr::drop_in_place(arr[i].as_mut_ptr() as *mut u8);
+                            ptr::drop_in_place(elem.as_mut_ptr() as *mut u8);
                         }
                     }
                 },
@@ -914,21 +956,17 @@ mod tests {
             let arr: Result<[u8; 16], &'static str> = try_init_unwind_safe(
                 0usize,
                 |i, mut uninit| {
-                    let arr = uninit.array_mut();
-
-                    while *i < 16 {
-                        arr[*i] = mem::MaybeUninit::new(*i as u8);
+                    for elem in uninit.array_mut() {
+                        *elem = mem::MaybeUninit::new(*i as u8);
                         *i += 1;
                     }
 
                     Ok(unsafe { uninit.assume_init() })
                 },
                 |i, err_unwound| {
-                    let mut arr = err_unwound.into_array();
-
-                    for i in 0..*i {
+                    for elem in &mut err_unwound.into_array()[0..*i] {
                         unsafe {
-                            ptr::drop_in_place(arr[i].as_mut_ptr() as *mut u8);
+                            ptr::drop_in_place(elem.as_mut_ptr() as *mut u8);
                         }
                     }
                 },
@@ -949,10 +987,8 @@ mod tests {
                 let arr: [DropValue; 16] = init_unwind_safe(
                     0usize,
                     |i, mut uninit| {
-                        let arr = uninit.array_mut();
-
-                        while *i < 16 {
-                            arr[*i] = mem::MaybeUninit::new(DropValue(drop_count.clone()));
+                        for elem in uninit.array_mut() {
+                            *elem = mem::MaybeUninit::new(DropValue(drop_count.clone()));
                             init_count += 1;
 
                             *i += 1;
@@ -964,11 +1000,9 @@ mod tests {
                         unsafe { uninit.assume_init() }
                     },
                     |i, unwound| {
-                        let mut arr = unwound.into_array();
-
-                        for i in 0..*i {
+                        for elem in &mut unwound.into_array()[0..*i] {
                             unsafe {
-                                ptr::drop_in_place(arr[i].as_mut_ptr() as *mut DropValue);
+                                ptr::drop_in_place(elem.as_mut_ptr() as *mut DropValue);
                             }
                         }
                     },
@@ -992,10 +1026,8 @@ mod tests {
                 let arr: Result<[DropValue; 16], io::Error> = try_init_unwind_safe(
                     0usize,
                     |i, mut uninit| {
-                        let arr = uninit.array_mut();
-
-                        while *i < 16 {
-                            arr[*i] = mem::MaybeUninit::new(DropValue(drop_count.clone()));
+                        for elem in uninit.array_mut() {
+                            *elem = mem::MaybeUninit::new(DropValue(drop_count.clone()));
                             init_count += 1;
 
                             *i += 1;
@@ -1007,11 +1039,9 @@ mod tests {
                         Ok(unsafe { uninit.assume_init() })
                     },
                     |i, unwound| {
-                        let mut arr = unwound.into_array();
-
-                        for i in 0..*i {
+                        for elem in &mut unwound.into_array()[0..*i] {
                             unsafe {
-                                ptr::drop_in_place(arr[i].as_mut_ptr() as *mut DropValue);
+                                ptr::drop_in_place(elem.as_mut_ptr() as *mut DropValue);
                             }
                         }
                     },

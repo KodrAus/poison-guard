@@ -58,19 +58,15 @@ Using `init_unwind_safe` it can be rewritten like this to try avoid leaks in cas
 let arr: [u8; 16] = init_unwind_safe(
     0usize,
     |i, mut uninit| {
-        let arr = uninit.array_mut();
-
-        for elem in &mut arr[0..16] {
-            *elem = MaybeUninit::new(i as u8);
-            i += 1;
+        for elem in uninit.array_mut() {
+            *elem = mem::MaybeUninit::new(*i as u8);
+            *i += 1;
         }
 
         unsafe { uninit.assume_init() }
     },
     |i, unwound| {
-        let mut arr = unwound.into_array();
-
-        for elem in &mut arr[0..*i] {
+        for elem in &mut unwound.into_array()[0..*i] {
             unsafe {
                 ptr::drop_in_place(elem.as_mut_ptr() as *mut u8);
             }
