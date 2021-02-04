@@ -699,6 +699,8 @@ mod tests {
     mod mutex {
         use super::*;
 
+        use std::{sync::Arc, thread};
+
         // An example wrapper for `parking_lot::Mutex`
         // This implements an inherent method on `MutexGuard<Poison<T>>` that shadows `Poison<T>`
         // We do this deliberately, knowing that the shadowed method is what we want
@@ -773,6 +775,26 @@ mod tests {
                 .unwrap_or_else(|guard| guard.recover(|v| *v = 42));
 
             assert_eq!(42, *guard);
+        }
+
+        #[test]
+        fn propagating_across_threads() {
+            let mutex = Arc::new(Mutex::new(Poison::new(42)));
+
+            let t = {
+                let mutex = mutex.clone();
+                thread::spawn(move || {
+                    let mut guard = mutex.lock().poison().unwrap();
+
+                    *guard += 1;
+
+                    panic!("lol");
+                })
+            };
+
+            assert!(t.join().is_err());
+
+            assert!(mutex.lock().is_poisoned());
         }
     }
 
