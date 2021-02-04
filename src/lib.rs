@@ -584,27 +584,27 @@ pub mod poison {
 
     #[derive(Debug)]
     struct PoisonError {
-        backtrace: Option<Backtrace>,
+        backtrace: Backtrace,
     }
 
     impl PoisonError {
         #[track_caller]
         fn from_err() -> Self {
             PoisonError {
-                backtrace: Some(Backtrace::capture()),
+                backtrace: Backtrace::capture(),
             }
         }
 
         #[track_caller]
         fn from_panic() -> Self {
             PoisonError {
-                backtrace: Some(Backtrace::capture()),
+                backtrace: Backtrace::capture(),
             }
         }
 
         #[track_caller]
         fn sentinel() -> Self {
-            PoisonError { backtrace: None }
+            PoisonError { backtrace: Backtrace::disabled() }
         }
     }
 
@@ -614,7 +614,11 @@ pub mod poison {
         }
     }
 
-    impl Error for PoisonError {}
+    impl Error for PoisonError {
+        fn backtrace(&self) -> Option<&Backtrace> {
+            Some(&self.backtrace)
+        }
+    }
 }
 
 #[cfg(test)]
