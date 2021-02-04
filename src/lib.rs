@@ -301,7 +301,6 @@ pub mod poison {
     A container that holds a potentially poisoned value.
     */
     pub struct Poison<T> {
-        recover_on_drop: bool,
         value: T,
         poisoned: Option<PoisonError>,
     }
@@ -312,7 +311,6 @@ pub mod poison {
         */
         pub fn new(v: T) -> Self {
             Poison {
-                recover_on_drop: true,
                 value: v,
                 poisoned: None,
             }
@@ -328,12 +326,10 @@ pub mod poison {
             // We're pretending the `UnwindSafe` and `RefUnwindSafe` traits don't exist
             match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
                 Ok(v) => Poison {
-                    recover_on_drop: true,
                     value: v,
                     poisoned: None,
                 },
                 Err(_) => Poison {
-                    recover_on_drop: true,
                     value: Default::default(),
                     poisoned: Some(PoisonError::from_panic()),
                 },
@@ -350,17 +346,14 @@ pub mod poison {
         {
             match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
                 Ok(Ok(v)) => Poison {
-                    recover_on_drop: true,
                     value: v,
                     poisoned: None,
                 },
                 Ok(Err(_)) => Poison {
-                    recover_on_drop: true,
                     value: Default::default(),
                     poisoned: Some(PoisonError::from_err()),
                 },
                 Err(_) => Poison {
-                    recover_on_drop: true,
                     value: Default::default(),
                     poisoned: Some(PoisonError::from_panic()),
                 },
@@ -403,11 +396,10 @@ pub mod poison {
                 })
             } else {
                 target.poisoned = Some(PoisonError::sentinel());
-                let recover_on_drop = target.recover_on_drop;
 
                 Ok(PoisonGuard {
                     target,
-                    recover_on_drop,
+                    recover_on_drop: true,
                     _marker: Default::default(),
                 })
             }
@@ -498,11 +490,9 @@ pub mod poison {
             f(&mut self.target.value);
             self.target.poisoned = None;
 
-            let recover_on_drop = self.target.recover_on_drop;
-
             PoisonGuard {
                 target: self.target,
-                recover_on_drop,
+                recover_on_drop: true,
                 _marker: Default::default(),
             }
         }
@@ -525,11 +515,9 @@ pub mod poison {
                 Ok(()) => {
                     self.target.poisoned = None;
 
-                    let recover_on_drop = self.target.recover_on_drop;
-
                     Ok(PoisonGuard {
                         target: self.target,
-                        recover_on_drop,
+                        recover_on_drop: true,
                         _marker: Default::default(),
                     })
                 }
