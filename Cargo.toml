@@ -6,3 +6,6 @@ edition = "2018"
 
 [dev-dependencies.parking_lot]
 version = "0.1"
+
+[dev-dependencies.trybuild]
+version = "1"
