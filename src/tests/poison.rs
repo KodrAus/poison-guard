@@ -92,22 +92,9 @@ fn guard_poisons_on_panic() {
 }
 
 #[test]
-fn enter_exit_guard() {
-    let mut v = Poison::new(42);
-
-    let mut g = Poison::enter(&mut v).unwrap();
-
-    *g += 1;
-
-    Poison::exit(g);
-
-    assert_eq!(43, *v.as_mut().poison().unwrap());
-}
-
-#[test]
 fn convert_poisoned_guard_into_error() {
     fn try_with(v: &mut Poison<i32>) -> Result<(), Box<dyn Error + 'static>> {
-        let guard = v.as_mut().poison()?;
+        let guard = v.poison()?;
 
         assert_eq!(42, *guard);
 
@@ -116,4 +103,38 @@ fn convert_poisoned_guard_into_error() {
 
     assert!(try_with(&mut Poison::new(42)).is_ok());
     assert!(try_with(&mut Poison::catch_unwind(|| panic!("explicit panic"))).is_err());
+}
+
+#[test]
+fn try_with() {
+    fn try_with(v: &mut Poison<i32>) -> Result<(), Box<dyn Error + 'static>> {
+        Poison::try_with(
+            v.poison().or_else(|recover| {
+                recover.try_recover(|guard| {
+                    *guard = 0;
+
+                    Ok::<(), io::Error>(())
+                })
+            })?,
+            |v| {
+                *v += 1;
+
+                if *v > 10 {
+                    return Err(io::ErrorKind::Other.into());
+                }
+
+                Ok::<(), io::Error>(())
+            },
+        )?;
+
+        Ok(())
+    }
+
+    let mut v = Poison::new(9);
+
+    assert!(try_with(&mut v).is_ok());
+    assert!(try_with(&mut v).is_err());
+    assert!(try_with(&mut v).is_ok());
+
+    assert!(try_with(&mut Poison::catch_unwind(|| panic!("explicit panic"))).is_ok());
 }

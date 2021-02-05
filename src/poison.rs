@@ -145,7 +145,6 @@ impl<T> Poison<T> {
         if self.is_poisoned() {
             Err(PoisonRecover {
                 target: self,
-                recover_on_drop: true,
                 _marker: Default::default(),
             })
         } else {
@@ -153,77 +152,58 @@ impl<T> Poison<T> {
 
             Ok(PoisonGuard {
                 target: self,
-                recover_on_drop: true,
                 _marker: Default::default(),
             })
         }
     }
 
     /**
-    Try poison the value contained behind some target reference and return a guard to it.
+    Use a guard within a closure that may fail or unwind.
 
-    The guard returned by `Poison::enter` will need to be passed to `Poison::exit` in order to recover the value.
-    If the guard is dropped without passing to `Poison::exit` then the value will remain poisoned.
-    This approach can be used to ensure a guard is poisoned if control leaves a block early for any reason,
-    including unwinds, `?`, `break`, and `return` statements.
+    If the closure fails then the value will be poisoned with the given error.
+
+    # Examples
+
+    ```
+    # use std::io::Error;
+    # use poison_guard::poison::Poison;
+    # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut v = Poison::new(42);
+
+    Poison::try_with(
+        v.as_mut()
+            .poison()
+            .unwrap_or_else(|poisoned| poisoned.recover(|v| *v = 42)),
+        |guard| {
+            *guard += 1;
+
+            Ok::<(), Error>(())
+        },
+    )?;
+    # Ok(())
+    # }
+    ```
     */
-    pub fn enter<'a, Target>(
-        mut target: Target,
-    ) -> Result<PoisonGuard<'a, T, Target>, PoisonRecover<'a, T, Target>>
-    where
-        Target: ops::DerefMut<Target = Poison<T>> + 'a,
-    {
-        if target.is_poisoned() {
-            Err(PoisonRecover {
-                target,
-                recover_on_drop: false,
-                _marker: Default::default(),
-            })
-        } else {
-            target.poisoned = PoisonState::sentinel();
-
-            Ok(PoisonGuard {
-                target,
-                recover_on_drop: false,
-                _marker: Default::default(),
-            })
-        }
-    }
-
-    /**
-    Exit a guard successfully.
-
-    This will leave the value unpoisoned.
-    */
-    pub fn exit<'a, Target>(guard: PoisonGuard<'a, T, Target>)
-    where
-        Target: ops::DerefMut<Target = Poison<T>> + 'a,
-    {
-        let mut target = PoisonGuard::take(guard);
-        target.poisoned = PoisonState::unpoisoned();
-    }
-
-    /**
-    Exit a guard with an error.
-
-    This will leave the value poisoned.
-    */
-    pub fn exit_with_err<'a, Target, E>(
-        guard: PoisonGuard<'a, T, Target>,
-        err: E,
-    ) -> PoisonRecover<'a, T, Target>
+    #[track_caller]
+    pub fn try_with<'a, U, E, Target>(
+        mut guard: PoisonGuard<'a, T, Target>,
+        f: impl FnOnce(&mut T) -> Result<U, E>,
+    ) -> Result<U, PoisonRecover<'a, T, Target>>
     where
         E: Error + Send + Sync + 'static,
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
     {
-        let recover_on_drop = guard.recover_on_drop;
-        let mut target = PoisonGuard::take(guard);
-        target.poisoned = PoisonState::from_err(Some(Box::new(err)));
+        match f(&mut *guard) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let mut target = PoisonGuard::take(guard);
+                target.poisoned = PoisonState::from_err(Some(Box::new(e)));
 
-        PoisonRecover {
-            target,
-            recover_on_drop,
-            _marker: Default::default(),
+                Err(PoisonRecover {
+                    target,
+                    _marker: Default::default(),
+                })
+            }
         }
     }
 }
@@ -237,17 +217,11 @@ impl<T> AsMut<Poison<T>> for Poison<T> {
 /**
 A guard for a valid value.
 */
-// TODO: One problem with this type and `recover_on_drop` is what you're supposed to do
-// if you receive a `PoisonGuard` in a method by-value. Should you always call `Poison::exit`?
-// That seems like a footgun to forget to do
-// We could make `poison()` return a `impl DerefMut<Target = T>`, and call it a `PoisonRef`
-// or something
 pub struct PoisonGuard<'a, T, Target = &'a mut Poison<T>>
 where
     Target: ops::DerefMut<Target = Poison<T>>,
 {
     target: Target,
-    recover_on_drop: bool,
     _marker: std::marker::PhantomData<&'a mut T>,
 }
 
@@ -258,7 +232,6 @@ where
     pub fn by_ref<'b>(guard: &'b mut Self) -> PoisonGuard<'b, T> {
         PoisonGuard {
             target: &mut *guard.target,
-            recover_on_drop: guard.recover_on_drop,
             _marker: Default::default(),
         }
     }
@@ -283,8 +256,6 @@ where
     fn drop(&mut self) {
         self.target.poisoned = if thread::panicking() {
             PoisonState::from_panic(None)
-        } else if !self.recover_on_drop {
-            PoisonState::from_err(None)
         } else {
             PoisonState::unpoisoned()
         };
@@ -331,7 +302,6 @@ where
     Target: ops::DerefMut<Target = Poison<T>>,
 {
     target: Target,
-    recover_on_drop: bool,
     _marker: std::marker::PhantomData<&'a mut T>,
 }
 
@@ -349,7 +319,6 @@ where
 
         PoisonGuard {
             target: self.target,
-            recover_on_drop: self.recover_on_drop,
             _marker: Default::default(),
         }
     }
@@ -371,7 +340,6 @@ where
 
                 Ok(PoisonGuard {
                     target: self.target,
-                    recover_on_drop: self.recover_on_drop,
                     _marker: Default::default(),
                 })
             }
@@ -386,7 +354,6 @@ where
     pub fn by_ref<'b>(guard: &'b mut Self) -> PoisonRecover<'b, T> {
         PoisonRecover {
             target: &mut *guard.target,
-            recover_on_drop: guard.recover_on_drop,
             _marker: Default::default(),
         }
     }

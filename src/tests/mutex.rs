@@ -1,6 +1,6 @@
 use crate::poison::*;
 
-use std::{sync::Arc, thread};
+use std::{io, sync::Arc, thread};
 
 use parking_lot::Mutex;
 
@@ -22,10 +22,9 @@ fn poisoning_mutex() {
     drop(guard);
 
     // Poison the guard without deadlocking the mutex
-    let v = Poison::enter(mutex.lock()).unwrap();
-
-    // Drop the guard without exiting it properly, this will leave it in a poisoned state
-    drop(v);
+    let _ = Poison::try_with(mutex.lock().poison().unwrap(), |_| {
+        Err::<(), io::Error>(io::ErrorKind::Other.into())
+    });
 
     let guard = mutex
         .lock()
