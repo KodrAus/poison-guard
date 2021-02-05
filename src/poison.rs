@@ -44,7 +44,6 @@ impl<T> Poison<T> {
     where
         T: Default,
     {
-        // We're pretending the `UnwindSafe` and `RefUnwindSafe` traits don't exist
         match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
             Ok(v) => Poison {
                 value: v,
@@ -213,6 +212,9 @@ impl<T> AsMut<Poison<T>> for Poison<T> {
         self
     }
 }
+
+impl<T> panic::UnwindSafe for Poison<T> {}
+impl<T> panic::RefUnwindSafe for Poison<T> {}
 
 /**
 A guard for a valid value.
