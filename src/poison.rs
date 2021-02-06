@@ -98,10 +98,7 @@ impl<T> Poison<T> {
     */
     pub fn get<'a>(&'a self) -> Result<&'a T, PoisonRecover<'a, T, &'a Self>> {
         if self.is_poisoned() {
-            Err(PoisonRecover {
-                target: self,
-                _marker: Default::default(),
-            })
+            Err(PoisonRecover::new(self))
         } else {
             Ok(&self.value)
         }
@@ -146,17 +143,11 @@ impl<T> Poison<T> {
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
     {
         if self.is_poisoned() {
-            Err(PoisonRecover {
-                target: self,
-                _marker: Default::default(),
-            })
+            Err(PoisonRecover::new(self))
         } else {
             self.poisoned = PoisonState::sentinel();
 
-            Ok(PoisonGuard {
-                target: self,
-                _marker: Default::default(),
-            })
+            Ok(PoisonGuard::new(self))
         }
     }
 
@@ -202,19 +193,13 @@ impl<T> Poison<T> {
                 let mut target = PoisonGuard::take(guard);
                 target.poisoned.with_err(Some(Box::new(e)));
 
-                Err(PoisonRecover {
-                    target,
-                    _marker: Default::default(),
-                })
+                Err(PoisonRecover::new(target))
             }
             Err(panic) => {
                 let mut target = PoisonGuard::take(guard);
                 target.poisoned.with_panic(Some(panic));
 
-                Err(PoisonRecover {
-                    target,
-                    _marker: Default::default(),
-                })
+                Err(PoisonRecover::new(target))
             }
         }
     }
@@ -241,9 +226,9 @@ impl<'a, T, Target> PoisonGuard<'a, T, Target>
 where
     Target: ops::DerefMut<Target = Poison<T>>,
 {
-    pub fn by_ref<'b>(guard: &'b mut Self) -> PoisonGuard<'b, T> {
+    fn new(target: Target) -> PoisonGuard<'a, T, Target> {
         PoisonGuard {
-            target: &mut *guard.target,
+            target,
             _marker: Default::default(),
         }
     }
@@ -270,7 +255,7 @@ where
             self.target.poisoned.with_panic(None);
         } else {
             self.target.poisoned = PoisonState::unpoisoned();
-        };
+        }
     }
 }
 
@@ -281,7 +266,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("PoisonGuard")
-            .field(&"value", &self.target.value)
+            .field(&"value", &**self)
             .finish()
     }
 }
@@ -326,10 +311,7 @@ where
         f(&mut self.target.value);
         self.target.poisoned = PoisonState::unpoisoned();
 
-        PoisonGuard {
-            target: self.target,
-            _marker: Default::default(),
-        }
+        PoisonGuard::new(self.target)
     }
 
     /**
@@ -347,10 +329,7 @@ where
             Ok(()) => {
                 self.target.poisoned = PoisonState::unpoisoned();
 
-                Ok(PoisonGuard {
-                    target: self.target,
-                    _marker: Default::default(),
-                })
+                Ok(PoisonGuard::new(self.target))
             }
             Err(e) => {
                 self.target.poisoned.with_err(Some(Box::new(e)));
@@ -359,10 +338,15 @@ where
             }
         }
     }
+}
 
-    pub fn by_ref<'b>(guard: &'b mut Self) -> PoisonRecover<'b, T> {
+impl<'a, T, Target> PoisonRecover<'a, T, Target>
+where
+    Target: ops::Deref<Target = Poison<T>>,
+{
+    fn new(target: Target) -> PoisonRecover<'a, T, Target> {
         PoisonRecover {
-            target: &mut *guard.target,
+            target,
             _marker: Default::default(),
         }
     }

@@ -219,16 +219,12 @@ fn init_guard_special_cleanup_panic() {
 
 #[test]
 fn init_guard_try_panic_on_err() {
-    let mut init_count = 0;
-    let drop_count = Arc::new(Mutex::new(0));
-
     let p = Poison::try_new_catch_unwind(|| {
-        let arr: Result<[DropValue; 16], io::Error> = try_init_unwind_safe(
+        let arr: Result<[u8; 16], io::Error> = try_init_unwind_safe(
             0usize,
             |i, mut uninit| {
                 for elem in uninit.array_mut() {
-                    *elem = MaybeUninit::new(DropValue(drop_count.clone()));
-                    init_count += 1;
+                    *elem = MaybeUninit::new(*i as u8);
 
                     *i += 1;
                     if *i == 8 {
@@ -239,6 +235,7 @@ fn init_guard_try_panic_on_err() {
                 Ok(unsafe { uninit.assume_init() })
             },
             |_, _| {
+                // We're not actually leaking here, but want to make sure this doesn't abort
                 panic!("explicit panic causing a leak");
             },
         );
@@ -247,7 +244,4 @@ fn init_guard_try_panic_on_err() {
     });
 
     assert!(p.is_poisoned());
-
-    assert!(init_count > 0);
-    assert_eq!(0, *drop_count.lock().unwrap());
 }

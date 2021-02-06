@@ -35,6 +35,7 @@ fn poisoning_mutex() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn propagating_across_threads() {
     let mutex = Arc::new(Mutex::new(Poison::new(42)));
 
@@ -52,17 +53,4 @@ fn propagating_across_threads() {
     assert!(t.join().is_err());
 
     assert!(mutex.lock().is_poisoned());
-}
-
-#[test]
-fn pass_guard_by_ref() {
-    fn takes_by_ref(mut guard: PoisonGuard<'_, i32>) {
-        *guard += 1;
-    }
-
-    let mutex = Mutex::new(Poison::new(42));
-
-    let mut guard = mutex.lock().poison().unwrap();
-
-    takes_by_ref(PoisonGuard::by_ref(&mut guard));
 }
