@@ -178,6 +178,7 @@ impl<T> Poison<T> {
     # }
     ```
     */
+    // TODO: Should we just remove this in favour of `{enter/exit}_with`?
     #[track_caller]
     pub fn try_with_catch_unwind<'a, U, E, Target>(
         mut guard: PoisonGuard<'a, T, Target>,
@@ -203,6 +204,50 @@ impl<T> Poison<T> {
             }
         }
     }
+
+    /**
+    Enter a strict scope where a regular poison guard must be unpoisoned manually.
+
+    This is an alternative to `try_with_catch_unwind` for operations that don't naturally fit
+    into a closure, such as async functions.
+    */
+    pub fn enter<'a, Target>(guard: PoisonGuard<'a, T, Target>) -> PoisonGuardStrict<'a, T, Target>
+    where
+        Target: ops::DerefMut<Target = Poison<T>> + 'a,
+    {
+        let target = PoisonGuard::take(guard);
+        PoisonGuardStrict::new(target)
+    }
+
+    /**
+    Exit a strict scope successfully.
+
+    The returned guard will unpoison on drop as normal.
+    */
+    pub fn exit_ok<'a, Target>(guard: PoisonGuardStrict<'a, T, Target>) -> PoisonGuard<'a, T, Target>
+    where
+        Target: ops::DerefMut<Target = Poison<T>> + 'a,
+    {
+        let target = PoisonGuardStrict::take(guard);
+
+        PoisonGuard::new(target)
+    }
+
+    /**
+    Exit a strict scope with an error.
+
+    The value will remain poisoned and must be recovered as normal.
+    */
+    pub fn exit_err<'a, E, Target>(guard: PoisonGuardStrict<'a, T, Target>, e: E) -> PoisonRecover<'a, T, Target>
+    where
+        E: Error + Send + Sync + 'static,
+        Target: ops::DerefMut<Target = Poison<T>> + 'a,
+    {
+        let mut target = PoisonGuardStrict::take(guard);
+        target.poisoned.with_err(Some(Box::new(e)));
+
+        PoisonRecover::new(target)
+    }
 }
 
 impl<T> AsMut<Poison<T>> for Poison<T> {
@@ -212,7 +257,7 @@ impl<T> AsMut<Poison<T>> for Poison<T> {
 }
 
 /**
-A guard for a valid value.
+A guard for a valid value that will unpoison on drop.
 */
 pub struct PoisonGuard<'a, T, Target = &'a mut Poison<T>>
 where
@@ -283,6 +328,86 @@ where
 }
 
 impl<'a, T, Target> ops::DerefMut for PoisonGuard<'a, T, Target>
+where
+    Target: ops::DerefMut<Target = Poison<T>>,
+{
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.target.value
+    }
+}
+
+/**
+A guard for a valid value that must be unpoisoned manually.
+*/
+pub struct PoisonGuardStrict<'a, T, Target = &'a mut Poison<T>>
+where
+    Target: ops::DerefMut<Target = Poison<T>>,
+{
+    target: Target,
+    _marker: std::marker::PhantomData<&'a mut T>,
+}
+
+impl<'a, T, Target> PoisonGuardStrict<'a, T, Target>
+where
+    Target: ops::DerefMut<Target = Poison<T>>,
+{
+    fn new(target: Target) -> PoisonGuardStrict<'a, T, Target> {
+        PoisonGuardStrict {
+            target,
+            _marker: Default::default(),
+        }
+    }
+
+    fn take(mut guard: Self) -> Target {
+        let target = &mut guard.target as *mut Target;
+
+        // Forgetting the struct itself here is ok, because the
+        // other fields of `PoisonGuardStrict` don't require `Drop`
+        mem::forget(guard);
+
+        // SAFETY: The target pointer is still valid
+        unsafe { ptr::read(target) }
+    }
+}
+
+impl<'a, T, Target> ops::Drop for PoisonGuardStrict<'a, T, Target>
+where
+    Target: ops::DerefMut<Target = Poison<T>>,
+{
+    #[track_caller]
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.target.poisoned.with_panic(None);
+        } else {
+            self.target.poisoned.with_err(None);
+        }
+    }
+}
+
+impl<'a, T, Target> fmt::Debug for PoisonGuardStrict<'a, T, Target>
+where
+    T: fmt::Debug,
+    Target: ops::DerefMut<Target = Poison<T>>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("PoisonGuardStrict")
+            .field(&"value", &**self)
+            .finish()
+    }
+}
+
+impl<'a, T, Target> ops::Deref for PoisonGuardStrict<'a, T, Target>
+where
+    Target: ops::DerefMut<Target = Poison<T>>,
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.target.value
+    }
+}
+
+impl<'a, T, Target> ops::DerefMut for PoisonGuardStrict<'a, T, Target>
 where
     Target: ops::DerefMut<Target = Poison<T>>,
 {

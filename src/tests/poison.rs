@@ -138,3 +138,34 @@ fn try_with() {
 
     assert!(try_with(&mut Poison::new_catch_unwind(|| panic!("explicit panic"))).is_ok());
 }
+
+#[test]
+fn scope_async_await() {
+    async fn _some_async_work() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        Ok(())
+    }
+
+    async fn _try_with(v: &mut Poison<i32>) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        let mut g = Poison::enter(v.poison().or_else(|recover| {
+            recover.try_recover(|guard| {
+                *guard = 0;
+
+                Ok::<(), io::Error>(())
+            })
+        })?);
+
+        *g += 1;
+
+        _some_async_work().await?;
+
+        // Make sure we can pass scopes across await boundaries
+        *g += 1;
+
+        if *g > 10 {
+            Err(Poison::exit_err(g, io::Error::from(io::ErrorKind::Other)).into())
+        } else {
+            Poison::exit_ok(g);
+            Ok(())
+        }
+    }
+}
