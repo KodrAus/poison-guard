@@ -4,7 +4,7 @@ use std::lazy::SyncLazy as Lazy;
 
 #[test]
 fn poisoning_lazy_ok() {
-    static LAZY: Lazy<Poison<i32>> = Lazy::new(|| Poison::catch_unwind(|| 42));
+    static LAZY: Lazy<Poison<i32>> = Lazy::new(|| Poison::new_catch_unwind(|| 42));
 
     assert_eq!(42, *LAZY.get().unwrap());
 }
@@ -12,7 +12,7 @@ fn poisoning_lazy_ok() {
 #[test]
 fn poisoning_lazy_panic() {
     static LAZY: Lazy<Poison<i32>> =
-        Lazy::new(|| Poison::catch_unwind(|| panic!("explicit panic during initialization")));
+        Lazy::new(|| Poison::new_catch_unwind(|| panic!("explicit panic during initialization")));
 
     assert!(LAZY.is_poisoned());
 }

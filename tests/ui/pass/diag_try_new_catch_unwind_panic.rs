@@ -5,13 +5,17 @@ use std::{iter, io, error::Error};
 use poison_guard::Poison;
 
 fn run() -> Result<(), Box<dyn Error + 'static>> {
-    let mut p = Poison::new(42);
+    let mut p = Poison::try_new_catch_unwind(|| {
+        let mut v = 42;
 
-    Poison::try_with(p.as_mut().poison().unwrap(), |g| {
-        *g += 1;
+        v += 1;
 
-        Err::<(), io::Error>(io::Error::new(io::ErrorKind::Interrupted, "an IO error"))
-    })?;
+        if v > 10 {
+            panic!("explicit panic");
+        }
+
+        Ok::<i32, io::Error>(v)
+    });
 
     let g = p.as_mut().poison()?;
 

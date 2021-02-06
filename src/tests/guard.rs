@@ -106,7 +106,7 @@ fn init_guard_panic() {
     let mut init_count = 0;
     let drop_count = Arc::new(Mutex::new(0));
 
-    let p = Poison::catch_unwind(|| {
+    let p = Poison::new_catch_unwind(|| {
         let arr: [DropValue; 16] = init_unwind_safe(
             0usize,
             |i, mut uninit| {
@@ -145,7 +145,7 @@ fn init_guard_try_err() {
     let mut init_count = 0;
     let drop_count = Arc::new(Mutex::new(0));
 
-    let p = Poison::try_catch_unwind(|| {
+    let p = Poison::try_new_catch_unwind(|| {
         let arr: Result<[DropValue; 16], io::Error> = try_init_unwind_safe(
             0usize,
             |i, mut uninit| {
@@ -183,7 +183,7 @@ fn init_guard_try_err() {
 fn init_guard_special_cleanup_panic() {
     let lock = Arc::new(Mutex::new(0));
 
-    let p = Poison::catch_unwind(|| {
+    let p = Poison::new_catch_unwind(|| {
         // Acquire the lock here
         let guard = lock.lock().unwrap();
 
@@ -222,7 +222,7 @@ fn init_guard_try_panic_on_err() {
     let mut init_count = 0;
     let drop_count = Arc::new(Mutex::new(0));
 
-    let p = Poison::try_catch_unwind(|| {
+    let p = Poison::try_new_catch_unwind(|| {
         let arr: Result<[DropValue; 16], io::Error> = try_init_unwind_safe(
             0usize,
             |i, mut uninit| {

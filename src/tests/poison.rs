@@ -71,7 +71,7 @@ fn guard_try_recover() {
 
 #[test]
 fn catch_unwind_produces_poisoned_guard() {
-    let v = Poison::catch_unwind(|| panic!("explicit panic"));
+    let v = Poison::new_catch_unwind(|| panic!("explicit panic"));
 
     assert!(v.is_poisoned());
 }
@@ -102,13 +102,13 @@ fn convert_poisoned_guard_into_error() {
     }
 
     assert!(try_with(&mut Poison::new(42)).is_ok());
-    assert!(try_with(&mut Poison::catch_unwind(|| panic!("explicit panic"))).is_err());
+    assert!(try_with(&mut Poison::new_catch_unwind(|| panic!("explicit panic"))).is_err());
 }
 
 #[test]
 fn try_with() {
     fn try_with(v: &mut Poison<i32>) -> Result<(), Box<dyn Error + 'static>> {
-        Poison::try_with(
+        Poison::try_with_catch_unwind(
             v.poison().or_else(|recover| {
                 recover.try_recover(|guard| {
                     *guard = 0;
@@ -136,5 +136,5 @@ fn try_with() {
     assert!(try_with(&mut v).is_err());
     assert!(try_with(&mut v).is_ok());
 
-    assert!(try_with(&mut Poison::catch_unwind(|| panic!("explicit panic"))).is_ok());
+    assert!(try_with(&mut Poison::new_catch_unwind(|| panic!("explicit panic"))).is_ok());
 }

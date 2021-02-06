@@ -23,7 +23,7 @@ For `SyncLazy`, that means catching panics that would cause global initializatio
 ```rust
 // In SyncLazy<T>
 
-static LAZY: SyncLazy<Poison<i32>> = SyncLazy::new(|| Poison::catch_unwind(|| {
+static LAZY: SyncLazy<Poison<i32>> = SyncLazy::new(|| Poison::new_catch_unwind(|| {
     if some_failure_condition {
         panic!("oh no!");
     }

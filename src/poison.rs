@@ -40,7 +40,7 @@ impl<T> Poison<T> {
     Any attempt to access the poisoned value will instead return this payload unless the `Poison<T>` is restored.
     */
     #[track_caller]
-    pub fn catch_unwind(f: impl FnOnce() -> T) -> Self
+    pub fn new_catch_unwind(f: impl FnOnce() -> T) -> Self
     where
         T: Default,
     {
@@ -63,7 +63,7 @@ impl<T> Poison<T> {
     Any attempt to access the poisoned value will instead return this payload unless the `Poison<T>` is restored.
     */
     #[track_caller]
-    pub fn try_catch_unwind<E>(f: impl FnOnce() -> Result<T, E>) -> Self
+    pub fn try_new_catch_unwind<E>(f: impl FnOnce() -> Result<T, E>) -> Self
     where
         T: Default,
         E: Error + Send + Sync + 'static,
@@ -163,7 +163,7 @@ impl<T> Poison<T> {
     /**
     Use a guard within a closure that may fail or unwind.
 
-    If the closure fails then the value will be poisoned with the given error.
+    If the closure fails or unwinds then the value will be poisoned with the given error.
 
     # Examples
 
@@ -173,7 +173,7 @@ impl<T> Poison<T> {
     # fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut v = Poison::new(42);
 
-    Poison::try_with(
+    Poison::try_with_catch_unwind(
         v.as_mut()
             .poison()
             .unwrap_or_else(|poisoned| poisoned.recover(|v| *v = 42)),
@@ -188,7 +188,7 @@ impl<T> Poison<T> {
     ```
     */
     #[track_caller]
-    pub fn try_with<'a, U, E, Target>(
+    pub fn try_with_catch_unwind<'a, U, E, Target>(
         mut guard: PoisonGuard<'a, T, Target>,
         f: impl FnOnce(&mut T) -> Result<U, E>,
     ) -> Result<U, PoisonRecover<'a, T, Target>>
@@ -196,11 +196,20 @@ impl<T> Poison<T> {
         E: Error + Send + Sync + 'static,
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
     {
-        match f(&mut *guard) {
-            Ok(v) => Ok(v),
-            Err(e) => {
+        match panic::catch_unwind(panic::AssertUnwindSafe(|| f(&mut *guard))) {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => {
                 let mut target = PoisonGuard::take(guard);
                 target.poisoned.with_err(Some(Box::new(e)));
+
+                Err(PoisonRecover {
+                    target,
+                    _marker: Default::default(),
+                })
+            }
+            Err(panic) => {
+                let mut target = PoisonGuard::take(guard);
+                target.poisoned.with_panic(Some(panic));
 
                 Err(PoisonRecover {
                     target,

@@ -1,15 +1,13 @@
-#![feature(backtrace)]
+#![feature(backtrace, once_cell)]
 
-use std::{iter, error::Error};
+use std::{iter, error::Error, panic, lazy::SyncLazy as Lazy};
 
 use poison_guard::Poison;
 
-fn run() -> Result<(), Box<dyn Error + 'static>> {
-    let mut p = Poison::<i32>::catch_unwind(|| {
-        panic!("explicit panic");
-    });
+static LAZY: Lazy<Poison<i32>> = Lazy::new(|| Poison::new_catch_unwind(|| panic!("explicit panic")));
 
-    let g = p.as_mut().poison()?;
+fn run() -> Result<(), Box<dyn Error + 'static>> {
+    let g = LAZY.get()?;
 
     assert_eq!(42, *g);
 

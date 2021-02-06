@@ -22,7 +22,7 @@ fn poisoning_mutex() {
     drop(guard);
 
     // Poison the guard without deadlocking the mutex
-    let _ = Poison::try_with(mutex.lock().poison().unwrap(), |_| {
+    let _ = Poison::try_with_catch_unwind(mutex.lock().poison().unwrap(), |_| {
         Err::<(), io::Error>(io::ErrorKind::Other.into())
     });
 
