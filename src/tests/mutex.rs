@@ -22,14 +22,15 @@ fn poisoning_mutex() {
     drop(guard);
 
     // Poison the guard without deadlocking the mutex
-    let _ = Poison::try_with_catch_unwind(mutex.lock().poison().unwrap(), |_| {
-        Err::<(), io::Error>(io::ErrorKind::Other.into())
-    });
+    let _ = Poison::err(
+        mutex.lock().poison().unwrap(),
+        io::Error::from(io::ErrorKind::Other),
+    );
 
     let guard = mutex
         .lock()
         .poison()
-        .unwrap_or_else(|guard| guard.recover(|v| *v = 42));
+        .unwrap_or_else(|guard| guard.recover_with(|v| *v = 42));
 
     assert_eq!(42, *guard);
 }

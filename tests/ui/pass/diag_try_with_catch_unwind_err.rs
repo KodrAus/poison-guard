@@ -7,11 +7,11 @@ use poison_guard::Poison;
 fn run() -> Result<(), Box<dyn Error + 'static>> {
     let mut p = Poison::new(42);
 
-    Poison::try_with_catch_unwind(p.as_mut().poison().unwrap(), |g| {
-        *g += 1;
+    let mut g = Poison::upgrade(p.as_mut().poison().unwrap());
 
-        Err::<(), io::Error>(io::Error::new(io::ErrorKind::Interrupted, "an IO error"))
-    })?;
+    *g += 1;
+
+    Poison::downgrade_err(g, io::Error::new(io::ErrorKind::Interrupted, "an IO error"));
 
     let g = p.as_mut().poison()?;
 

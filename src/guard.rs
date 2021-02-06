@@ -284,4 +284,6 @@ where
     }
 }
 
-// TODO: `drop_unwind_safe` and `try_drop_unwind_safe`
+pub fn drop_unwind_safe<T>(_drop: impl FnOnce(&mut T), _on_unwind: impl FnOnce(&mut T)) -> T {
+    unimplemented!("try drop the value, resume on unwind")
+}

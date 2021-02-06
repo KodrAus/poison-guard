@@ -137,7 +137,7 @@ impl<T> Poison<T> {
     */
     #[track_caller]
     pub fn poison<'a, Target>(
-        mut self: Target,
+        self: Target,
     ) -> Result<PoisonGuard<'a, T, Target>, PoisonRecover<'a, T, Target>>
     where
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
@@ -145,64 +145,37 @@ impl<T> Poison<T> {
         if self.is_poisoned() {
             Err(PoisonRecover::new(self))
         } else {
-            self.poisoned = PoisonState::sentinel();
-
             Ok(PoisonGuard::new(self))
         }
     }
 
     /**
-    Use a guard within a closure that may fail or unwind.
-
-    If the closure fails or unwinds then the value will be poisoned with the given error.
-
-    # Examples
-
-    ```
-    # use std::io::Error;
-    # use poison_guard::poison::Poison;
-    # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut v = Poison::new(42);
-
-    Poison::try_with_catch_unwind(
-        v.as_mut()
-            .poison()
-            .unwrap_or_else(|poisoned| poisoned.recover(|v| *v = 42)),
-        |guard| {
-            *guard += 1;
-
-            Ok::<(), Error>(())
-        },
-    )?;
-    # Ok(())
-    # }
-    ```
+    Drop a guard, unpoisoning the value.
     */
-    // TODO: Should we just remove this in favour of `{enter/exit}_with`?
     #[track_caller]
-    pub fn try_with_catch_unwind<'a, U, E, Target>(
-        mut guard: PoisonGuard<'a, T, Target>,
-        f: impl FnOnce(&mut T) -> Result<U, E>,
-    ) -> Result<U, PoisonRecover<'a, T, Target>>
+    pub fn ok<'a, Target>(guard: PoisonGuard<'a, T, Target>) -> Target
+    where
+        Target: ops::DerefMut<Target = Poison<T>> + 'a,
+    {
+        PoisonGuard::take(guard)
+    }
+
+    /**
+    Drop a guard, poisoning the value with the given error.
+    */
+    #[track_caller]
+    pub fn err<'a, E, Target>(
+        guard: PoisonGuard<'a, T, Target>,
+        e: E,
+    ) -> PoisonRecover<'a, T, Target>
     where
         E: Error + Send + Sync + 'static,
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
     {
-        match panic::catch_unwind(panic::AssertUnwindSafe(|| f(&mut *guard))) {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => {
-                let mut target = PoisonGuard::take(guard);
-                target.poisoned.with_err(Some(Box::new(e)));
+        let mut target = PoisonGuard::take(guard);
+        target.poisoned.with_err(Some(Box::new(e)));
 
-                Err(PoisonRecover::new(target))
-            }
-            Err(panic) => {
-                let mut target = PoisonGuard::take(guard);
-                target.poisoned.with_panic(Some(panic));
-
-                Err(PoisonRecover::new(target))
-            }
-        }
+        PoisonRecover::new(target)
     }
 
     /**
@@ -211,7 +184,10 @@ impl<T> Poison<T> {
     This is an alternative to `try_with_catch_unwind` for operations that don't naturally fit
     into a closure, such as async functions.
     */
-    pub fn enter<'a, Target>(guard: PoisonGuard<'a, T, Target>) -> PoisonGuardStrict<'a, T, Target>
+    #[track_caller]
+    pub fn upgrade<'a, Target>(
+        guard: PoisonGuard<'a, T, Target>,
+    ) -> PoisonGuardStrict<'a, T, Target>
     where
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
     {
@@ -224,7 +200,10 @@ impl<T> Poison<T> {
 
     The returned guard will unpoison on drop as normal.
     */
-    pub fn exit_ok<'a, Target>(guard: PoisonGuardStrict<'a, T, Target>) -> PoisonGuard<'a, T, Target>
+    #[track_caller]
+    pub fn downgrade_ok<'a, Target>(
+        guard: PoisonGuardStrict<'a, T, Target>,
+    ) -> PoisonGuard<'a, T, Target>
     where
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
     {
@@ -238,7 +217,11 @@ impl<T> Poison<T> {
 
     The value will remain poisoned and must be recovered as normal.
     */
-    pub fn exit_err<'a, E, Target>(guard: PoisonGuardStrict<'a, T, Target>, e: E) -> PoisonRecover<'a, T, Target>
+    #[track_caller]
+    pub fn downgrade_err<'a, E, Target>(
+        guard: PoisonGuardStrict<'a, T, Target>,
+        e: E,
+    ) -> PoisonRecover<'a, T, Target>
     where
         E: Error + Send + Sync + 'static,
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
@@ -271,7 +254,10 @@ impl<'a, T, Target> PoisonGuard<'a, T, Target>
 where
     Target: ops::DerefMut<Target = Poison<T>>,
 {
-    fn new(target: Target) -> PoisonGuard<'a, T, Target> {
+    #[track_caller]
+    fn new(mut target: Target) -> PoisonGuard<'a, T, Target> {
+        target.poisoned = PoisonState::sentinel();
+
         PoisonGuard {
             target,
             _marker: Default::default(),
@@ -351,7 +337,10 @@ impl<'a, T, Target> PoisonGuardStrict<'a, T, Target>
 where
     Target: ops::DerefMut<Target = Poison<T>>,
 {
-    fn new(target: Target) -> PoisonGuardStrict<'a, T, Target> {
+    #[track_caller]
+    fn new(mut target: Target) -> PoisonGuardStrict<'a, T, Target> {
+        target.poisoned = PoisonState::sentinel();
+
         PoisonGuardStrict {
             target,
             _marker: Default::default(),
@@ -432,18 +421,25 @@ where
     Recover a poisoned value.
     */
     #[track_caller]
-    pub fn recover(mut self, f: impl FnOnce(&mut T)) -> PoisonGuard<'a, T, Target> {
+    pub fn recover(self) -> PoisonGuard<'a, T, Target> {
+        PoisonGuard::new(self.target)
+    }
+
+    /**
+    Recover a poisoned value with the given closure.
+    */
+    #[track_caller]
+    pub fn recover_with(mut self, f: impl FnOnce(&mut T)) -> PoisonGuard<'a, T, Target> {
         f(&mut self.target.value);
-        self.target.poisoned = PoisonState::unpoisoned();
 
         PoisonGuard::new(self.target)
     }
 
     /**
-    Try recover a poisoned value.
+    Try recover a poisoned value with the given closure.
     */
     #[track_caller]
-    pub fn try_recover<E>(
+    pub fn try_recover_with<E>(
         mut self,
         f: impl FnOnce(&mut T) -> Result<(), E>,
     ) -> Result<PoisonGuard<'a, T, Target>, PoisonRecover<'a, T, Target>>

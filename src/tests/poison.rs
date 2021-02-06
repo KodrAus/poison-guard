@@ -33,7 +33,7 @@ fn guard_recover() {
     let guard = v
         .as_mut()
         .poison()
-        .unwrap_or_else(|guard| guard.recover(|v| *v = 42));
+        .unwrap_or_else(|guard| guard.recover_with(|v| *v = 42));
 
     assert_eq!(42, *guard);
     drop(guard);
@@ -55,7 +55,7 @@ fn guard_try_recover() {
         .as_mut()
         .poison()
         .or_else(|guard| {
-            guard.try_recover(|v| {
+            guard.try_recover_with(|v| {
                 *v = 42;
                 Ok::<(), io::Error>(())
             })
@@ -106,65 +106,33 @@ fn convert_poisoned_guard_into_error() {
 }
 
 #[test]
-fn try_with() {
-    fn try_with(v: &mut Poison<i32>) -> Result<(), Box<dyn Error + 'static>> {
-        Poison::try_with_catch_unwind(
-            v.poison().or_else(|recover| {
-                recover.try_recover(|guard| {
-                    *guard = 0;
-
-                    Ok::<(), io::Error>(())
-                })
-            })?,
-            |v| {
-                *v += 1;
-
-                if *v > 10 {
-                    return Err(io::ErrorKind::Other.into());
-                }
-
-                Ok::<(), io::Error>(())
-            },
-        )?;
-
-        Ok(())
-    }
-
-    let mut v = Poison::new(9);
-
-    assert!(try_with(&mut v).is_ok());
-    assert!(try_with(&mut v).is_err());
-    assert!(try_with(&mut v).is_ok());
-
-    assert!(try_with(&mut Poison::new_catch_unwind(|| panic!("explicit panic"))).is_ok());
-}
-
-#[test]
 fn scope_async_await() {
     async fn _some_async_work() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         Ok(())
     }
 
     async fn _try_with(v: &mut Poison<i32>) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-        let mut g = Poison::enter(v.poison().or_else(|recover| {
-            recover.try_recover(|guard| {
+        let g = v.poison().or_else(|recover| {
+            recover.try_recover_with(|guard| {
                 *guard = 0;
 
                 Ok::<(), io::Error>(())
             })
-        })?);
+        })?;
+
+        let mut g = Poison::upgrade(g);
 
         *g += 1;
 
         _some_async_work().await?;
 
-        // Make sure we can pass scopes across await boundaries
+        // Make sure we can pass guards across await boundaries
         *g += 1;
 
         if *g > 10 {
-            Err(Poison::exit_err(g, io::Error::from(io::ErrorKind::Other)).into())
+            Err(Poison::downgrade_err(g, io::Error::from(io::ErrorKind::Other)).into())
         } else {
-            Poison::exit_ok(g);
+            Poison::downgrade_ok(g);
             Ok(())
         }
     }
