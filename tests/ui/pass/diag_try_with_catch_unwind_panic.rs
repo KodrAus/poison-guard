@@ -1,21 +1,23 @@
 #![feature(backtrace)]
 
-use std::{iter, error::Error, panic};
+use std::{iter, io, error::Error};
 
 use poison_guard::Poison;
 
 fn run() -> Result<(), Box<dyn Error + 'static>> {
     let mut p = Poison::new(42);
 
-    let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let mut g = Poison::upgrade(p.as_mut().poison().unwrap());
+    let mut s = Poison::scope(p.as_mut().poison().unwrap());
 
+    s.try_catch_unwind(|g| {
         *g += 1;
 
         panic!("explicit panic");
-    }));
 
-    let g = p.as_mut().poison()?;
+        Ok::<(), io::Error>(())
+    })?;
+
+    let g = s.poison()?;
 
     assert_eq!(42, *g);
 

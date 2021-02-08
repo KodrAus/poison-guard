@@ -1,6 +1,6 @@
 use crate::poison::Poison;
 
-use std::{error::Error, io, mem, panic};
+use std::{error::Error, io, mem, panic, ops::Try};
 
 #[test]
 fn poison_size() {
@@ -121,12 +121,8 @@ fn scope_sync() {
 
             *v += 1;
 
-            Ok::<_, io::Error>(v)
+            Ok::<(), io::Error>(())
         })?;
-
-        // Borrowed values can escape the closure here
-        // But they can't escape the `Poison` itself
-        *v1 += 1;
 
         let mut v2 = s.poison()?;
 
@@ -169,5 +165,51 @@ async fn scope_async() {
     let mut p = Poison::new(42);
 
     assert!(do_work(&mut p).await.is_err());
+    assert!(p.is_poisoned());
+}
+
+#[test]
+fn scope_escape() {
+    let mut p = Poison::new(42);
+
+    // We can escape a poison scope here
+    let mut s = Poison::scope(p.as_mut().poison().unwrap());
+
+    let mut v = None;
+    let _ = s.try_catch_unwind(|g| {
+        v = Some(g);
+        panic!("explicit panic");
+
+        Ok::<(), io::Error>(())
+    }).into_result().unwrap_err();
+
+    let mut v = v.unwrap();
+
+    *v += 1;
+
+    drop(s);
+
+    // In the end we still poison the value
+    assert!(p.is_poisoned());
+
+    // But that's pretty much the same as doing this
+    let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let mut g = p.as_mut().poison().unwrap_or_else(|g| g.recover());
+
+        let mut v = None;
+        let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            v = Some(g);
+            panic!("explicit panic");
+
+            Ok::<(), io::Error>(())
+        }));
+
+        let mut v = v.unwrap();
+
+        *v += 1;
+
+        let _ = r.unwrap();
+    }));
+
     assert!(p.is_poisoned());
 }
