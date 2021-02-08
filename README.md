@@ -6,6 +6,8 @@ It's a bit like the [`poison`](https://github.com/reem/rust-poison) and [`with_d
 
 ## Use cases
 
+### `Poison<T>`
+
 The `Poison<T>` type is intended to be used in synchronization primitives to standardize their poisoning behavior in the presence of unwinds.
 
 For `Mutex`, that means detecting panics that unwind through a lock and giving users a chance to recover from them:
@@ -35,6 +37,10 @@ if !LAZY.is_poisoned() {
     assert_eq!(42, *LAZY.get().unwrap());
 }
 ```
+
+`Poison<T>` retains some context about how the guard was originally poisoned for future callers. If a poisoned guard is propagated across threads it offers some better debug information than what you'd get with a plain panic.
+
+### `init_unwind_safe`
 
 The `init_unwind_safe` function can be used to make working with `MaybeUninit` less leaky.
 
