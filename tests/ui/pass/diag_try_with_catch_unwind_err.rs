@@ -7,13 +7,15 @@ use poison_guard::Poison;
 fn run() -> Result<(), Box<dyn Error + 'static>> {
     let mut p = Poison::new(42);
 
-    let mut g = Poison::upgrade(p.as_mut().poison().unwrap());
+    let mut s = Poison::scope(p.as_mut().poison().unwrap());
 
-    *g += 1;
+    s.try_catch_unwind(|g| {
+        *g += 1;
 
-    Poison::downgrade_err(g, io::Error::new(io::ErrorKind::Interrupted, "an IO error"));
+        Err::<(), io::Error>(io::Error::new(io::ErrorKind::Interrupted, "an IO error"))
+    })?;
 
-    let g = p.as_mut().poison()?;
+    let g = s.poison()?;
 
     assert_eq!(42, *g);
 

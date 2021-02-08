@@ -4,8 +4,15 @@ version = "0.1.0"
 authors = ["Ashley Mannix <kodraus@hey.com>"]
 edition = "2018"
 
+[dependencies.pin-project]
+version = "1"
+
 [dev-dependencies.parking_lot]
 version = "0.1"
 
 [dev-dependencies.trybuild]
 version = "1"
+
+[dev-dependencies.tokio]
+version = "1"
+features = ["macros", "rt"]

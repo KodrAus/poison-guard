@@ -106,34 +106,68 @@ fn convert_poisoned_guard_into_error() {
 }
 
 #[test]
-fn scope_async_await() {
-    async fn _some_async_work() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+fn scope_sync() {
+    fn do_other_work() -> Result<(), io::Error> {
+        Err(io::Error::from(io::ErrorKind::Other))
+    }
+
+    fn do_work(p: &mut Poison<i32>) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        let mut s = Poison::scope(p.poison()?);
+
+        let v1 = s.try_catch_unwind(|v| {
+            *v += 1;
+
+            do_other_work()?;
+
+            *v += 1;
+
+            Ok::<_, io::Error>(v)
+        })?;
+
+        // Borrowed values can escape the closure here
+        // But they can't escape the `Poison` itself
+        *v1 += 1;
+
+        let mut v2 = s.poison()?;
+
+        *v2 += 1;
+
         Ok(())
     }
 
-    async fn _try_with(v: &mut Poison<i32>) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-        let g = v.poison().or_else(|recover| {
-            recover.try_recover_with(|guard| {
-                *guard = 0;
+    let mut p = Poison::new(42);
 
-                Ok::<(), io::Error>(())
-            })
-        })?;
+    assert!(do_work(&mut p).is_err());
+    assert!(p.is_poisoned());
+}
 
-        let mut g = Poison::upgrade(g);
-
-        *g += 1;
-
-        _some_async_work().await?;
-
-        // Make sure we can pass guards across await boundaries
-        *g += 1;
-
-        if *g > 10 {
-            Err(Poison::downgrade_err(g, io::Error::from(io::ErrorKind::Other)).into())
-        } else {
-            Poison::downgrade_ok(g);
-            Ok(())
-        }
+#[tokio::test]
+async fn scope_async() {
+    async fn do_other_work() -> Result<(), io::Error> {
+        Err(io::Error::from(io::ErrorKind::Other))
     }
+
+    async fn do_work(p: &mut Poison<i32>) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        let mut s = Poison::scope(p.poison()?);
+
+        s.try_catch_unwind(|v| async move {
+            *v += 1;
+
+            do_other_work().await?;
+
+            Ok::<(), io::Error>(())
+        })
+        .await?;
+
+        let mut v = s.poison()?;
+
+        *v += 1;
+
+        Ok(())
+    }
+
+    let mut p = Poison::new(42);
+
+    assert!(do_work(&mut p).await.is_err());
+    assert!(p.is_poisoned());
 }
