@@ -7,6 +7,9 @@ edition = "2018"
 [dependencies.pin-project]
 version = "1"
 
+[dev-dependencies.anyhow]
+version = "1"
+
 [dev-dependencies.parking_lot]
 version = "0.1"
 

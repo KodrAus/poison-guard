@@ -1,5 +1,6 @@
 use std::{
     error::Error,
+    fmt,
     future::Future,
     marker, mem,
     ops::{self, Try},
@@ -44,9 +45,9 @@ where
     # use poison_guard::Poison;
     # fn err_too_big() -> io::Error { io::ErrorKind::Other.into() }
     # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut poison = Poison::new(1);
+    let mut p = Poison::new(1);
 
-    let mut scope = Poison::scope(poison.as_mut()?);
+    let mut scope = Poison::scope(p.as_mut().poison()?);
 
     scope.try_catch_unwind(|v| {
         *v += 1;
@@ -71,14 +72,14 @@ where
     # use std::io;
     # use poison_guard::Poison;
     # fn err_too_big() -> io::Error { io::ErrorKind::Other.into() }
-    # async fn some_other_work(i: &mut i32) -> io::Error { io::ErrorKind::Other.into() }
+    # async fn some_other_work(i: &mut i32) -> Result<(), io::Error> { Err(io::ErrorKind::Other.into()) }
     # fn main() {}
     # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut poison = Poison::new(1);
+    let mut p = Poison::new(1);
 
-    let mut scope = Poison::scope(poison.as_mut()?);
+    let mut scope = Poison::scope(p.as_mut().poison()?);
 
-    scope.try_catch_unwind(|v| async {
+    scope.try_catch_unwind(|v| async move {
         *v += 1;
 
         some_other_work(v).await?;
@@ -97,10 +98,10 @@ where
     # }
     ```
     */
-    pub fn try_catch_unwind<'b, Initial, Continue, R>(
+    pub fn try_catch_unwind<'b, Initial, Continue, Ok>(
         &'b mut self,
         with: Initial,
-    ) -> TryCatchUnwind<'b, T, Initial, Continue, R>
+    ) -> TryCatchUnwind<'b, T, Initial, Continue, Ok>
     where
         Initial: FnOnce(&'b mut T) -> Continue,
     {
@@ -121,7 +122,7 @@ where
                 &mut self.state,
             ))))
         } else {
-            TryCatchUnwind(TryCatchUnwindInner::Err(Some(self.state.to_error())))
+            TryCatchUnwind(TryCatchUnwindInner::Done(Some(Err(self.state.to_error()))))
         }
     }
 
@@ -189,16 +190,80 @@ An active poison scope.
 */
 #[pin_project]
 #[must_use = "poison scopes do nothing unless `?`ed or `await`ed"]
-pub struct TryCatchUnwind<'a, T, Initial, Continue, R>(
-    #[pin] TryCatchUnwindInner<'a, T, Initial, Continue, R>,
+pub struct TryCatchUnwind<'a, T, Initial, Continue, Ok>(
+    #[pin] TryCatchUnwindInner<'a, T, Initial, Continue, Ok>,
 );
 
 #[pin_project(project = InnerProjection)]
-enum TryCatchUnwindInner<'a, T, Initial, Continue, R> {
+enum TryCatchUnwindInner<'a, T, Initial, Continue, Ok> {
     Initial(Option<(Initial, &'a mut T, &'a mut PoisonState)>),
     Continue(#[pin] Continue, &'a mut PoisonState),
-    Ok(Option<R>),
-    Err(Option<PoisonError>),
+    Done(Option<Result<Ok, PoisonError>>),
+}
+
+impl<'a, T, Initial, Continue, Ok> TryCatchUnwind<'a, T, Initial, Continue, Ok>
+where
+    TryCatchUnwind<'a, T, Initial, Continue, Ok>: Try,
+{
+    /**
+    Map the successful value produced by a scope.
+    */
+    pub fn map<U>(
+        self,
+        op: impl FnOnce(<Self as Try>::Ok) -> U,
+    ) -> Result<U, <Self as Try>::Error> {
+        self.into_result().map(op)
+    }
+
+    /**
+    Map the error value produced by a scope.
+    */
+    pub fn map_err<F>(
+        self,
+        op: impl FnOnce(<Self as Try>::Error) -> F,
+    ) -> Result<<Self as Try>::Ok, F> {
+        self.into_result().map_err(op)
+    }
+
+    /**
+    Unwrap the successful value produced by a scope, panicking if it failed.
+    */
+    pub fn unwrap(self) -> <Self as Try>::Ok
+    where
+        <Self as Try>::Error: fmt::Debug,
+    {
+        self.into_result().unwrap()
+    }
+
+    /**
+    Unwrap the error value produced by a scope, panicking if it succeeded.
+    */
+    pub fn unwrap_err(self) -> <Self as Try>::Error
+    where
+        <Self as Try>::Ok: fmt::Debug,
+    {
+        self.into_result().unwrap_err()
+    }
+
+    /**
+    Unwrap the successful value produced by a scope, panicking with the given message if it failed.
+    */
+    pub fn expect(self, msg: &str) -> <Self as Try>::Ok
+    where
+        <Self as Try>::Error: fmt::Debug,
+    {
+        self.into_result().expect(msg)
+    }
+
+    /**
+    Unwrap the error value produced by a scope, panicking with the given message if it succeeded.
+    */
+    pub fn expect_err(self, msg: &str) -> <Self as Try>::Error
+    where
+        <Self as Try>::Ok: fmt::Debug,
+    {
+        self.into_result().expect_err(msg)
+    }
 }
 
 // Synchronous scoping
@@ -206,7 +271,7 @@ impl<'a, T, Initial, Continue, R> Try for TryCatchUnwind<'a, T, Initial, Continu
 where
     Initial: FnOnce(&'a mut T) -> Continue,
     Continue: Try<Ok = R>,
-    Continue::Error: Error + Send + Sync + 'static,
+    Continue::Error: Into<Box<dyn Error + Send + Sync>>,
 {
     type Ok = R;
     type Error = PoisonError;
@@ -228,33 +293,32 @@ where
             TryCatchUnwindInner::Continue(scope, poisoned) => match scope.into_result() {
                 Ok(r) => Ok(r),
                 Err(e) => {
-                    poisoned.then_to_err(Some(Box::new(e)));
+                    poisoned.then_to_err(Some(e.into()));
                     Err(poisoned.to_error())
                 }
             },
-            TryCatchUnwindInner::Ok(r) => Ok(r.unwrap()),
-            TryCatchUnwindInner::Err(e) => Err(e.unwrap()),
+            TryCatchUnwindInner::Done(r) => r.unwrap(),
         }
     }
 
     fn from_error(e: PoisonError) -> Self {
-        TryCatchUnwind(TryCatchUnwindInner::Err(Some(e)))
+        TryCatchUnwind(TryCatchUnwindInner::Done(Some(Err(e))))
     }
 
     fn from_ok(r: R) -> Self {
-        TryCatchUnwind(TryCatchUnwindInner::Ok(Some(r)))
+        TryCatchUnwind(TryCatchUnwindInner::Done(Some(Ok(r))))
     }
 }
 
 // Asynchronous scoping
-impl<'a, T, Initial, Continue, R> Future for TryCatchUnwind<'a, T, Initial, Continue, R>
+impl<'a, T, Initial, Continue, Ok> Future for TryCatchUnwind<'a, T, Initial, Continue, Ok>
 where
     Initial: FnOnce(&'a mut T) -> Continue,
     Continue: Future,
-    Continue::Output: Try<Ok = R>,
-    <Continue::Output as Try>::Error: Error + Send + Sync + 'static,
+    Continue::Output: Try<Ok = Ok>,
+    <Continue::Output as Try>::Error: Into<Box<dyn Error + Send + Sync>>,
 {
-    type Output = Result<R, PoisonError>;
+    type Output = Result<Ok, PoisonError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context) -> task::Poll<Self::Output> {
         let projected = self.as_mut().project();
@@ -283,7 +347,7 @@ where
                     Ok(task::Poll::Ready(r)) => match r.into_result() {
                         Ok(r) => task::Poll::Ready(Ok(r)),
                         Err(e) => {
-                            poisoned.then_to_err(Some(Box::new(e)));
+                            poisoned.then_to_err(Some(e.into()));
                             task::Poll::Ready(Err(poisoned.to_error()))
                         }
                     },
@@ -293,8 +357,7 @@ where
                     }
                 }
             }
-            InnerProjection::Ok(r) => task::Poll::Ready(Ok(r.take().unwrap())),
-            InnerProjection::Err(e) => task::Poll::Ready(Err(e.take().unwrap())),
+            InnerProjection::Done(r) => task::Poll::Ready(r.take().unwrap()),
         }
     }
 }

@@ -16,6 +16,9 @@ where
 {
     /**
     Recover a poisoned value.
+
+    This method won't make any changes to the underlying value.
+    After this call, any future accesses to the value will succeed.
     */
     #[track_caller]
     pub fn recover(self) -> PoisonGuard<'a, T, Target> {
@@ -24,6 +27,8 @@ where
 
     /**
     Recover a poisoned value with the given closure.
+
+    After this call, any future accesses to the value will succeed.
     */
     #[track_caller]
     pub fn recover_with(mut self, f: impl FnOnce(&mut T)) -> PoisonGuard<'a, T, Target> {
@@ -34,6 +39,8 @@ where
 
     /**
     Try recover a poisoned value with the given closure.
+
+    If this call succeeds, any future accesses to the value will succeed.
     */
     #[track_caller]
     pub fn try_recover_with<E>(
@@ -41,7 +48,7 @@ where
         f: impl FnOnce(&mut T) -> Result<(), E>,
     ) -> Result<PoisonGuard<'a, T, Target>, PoisonRecover<'a, T, Target>>
     where
-        E: Error + Send + Sync + 'static,
+        E: Into<Box<dyn Error + Send + Sync>>,
     {
         match f(&mut self.target.value) {
             Ok(()) => {
@@ -50,11 +57,18 @@ where
                 Ok(PoisonGuard::new(self.target))
             }
             Err(e) => {
-                self.target.state.then_to_err(Some(Box::new(e)));
+                self.target.state.then_to_err(Some(e.into()));
 
                 Err(self)
             }
         }
+    }
+
+    /**
+    Convert this recovery guard into an error.
+    */
+    pub fn into_error(self) -> PoisonError {
+        self.into()
     }
 }
 
