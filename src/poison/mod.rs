@@ -25,7 +25,7 @@ use self::error::PoisonState;
 /**
 A container that holds a potentially poisoned value.
 
-`Poison<T>` doesn't mange its own synchronization, so it needs to be wrapped in a `Once` or a
+`Poison<T>` doesn't manage its own synchronization, so it needs to be wrapped in a `Once` or a
 `Mutex` so it can be shared.
 */
 pub struct Poison<T> {
