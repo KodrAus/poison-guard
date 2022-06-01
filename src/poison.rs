@@ -2,18 +2,25 @@
 Unwind-safe containers.
 */
 
-use std::any::Any;
 use std::{
     error::Error,
     ops,
-    panic::{self, Location},
+    panic::{
+        self,
+        Location,
+        RefUnwindSafe,
+    },
 };
 
 mod error;
 mod guard;
 mod recover;
 
-pub use self::{error::PoisonError, guard::PoisonGuard, recover::PoisonRecover};
+pub use self::{
+    error::PoisonError,
+    guard::PoisonGuard,
+    recover::PoisonRecover,
+};
 
 use self::error::PoisonState;
 
@@ -27,6 +34,8 @@ pub struct Poison<T> {
     value: T,
     state: PoisonState,
 }
+
+impl<T> RefUnwindSafe for Poison<T> {}
 
 impl<T> Poison<T> {
     /**
@@ -236,6 +245,7 @@ impl<T> Poison<T> {
     assert_eq!(42, *guard);
     ```
     */
+    #[track_caller]
     pub fn on_unwind<'a, Target>(
         poison: Target,
     ) -> Result<PoisonGuard<'a, T, Target>, PoisonRecover<'a, T, Target>>
@@ -250,8 +260,9 @@ impl<T> Poison<T> {
     }
 
     /**
-
+    Get a guard to the value that will immediately poison and only unpoison with `Poison::recover` or `Poison::try_recover`.
     */
+    #[track_caller]
     pub fn unless_recovered<'a, Target>(
         poison: Target,
     ) -> Result<PoisonGuard<'a, T, Target>, PoisonRecover<'a, T, Target>>
@@ -275,20 +286,7 @@ impl<T> Poison<T> {
         E: Into<Box<dyn Error + Send + Sync>>,
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
     {
-        PoisonGuard::err(guard, err);
-    }
-
-    /**
-    Poison a guard explicitly with a panic payload.
-    */
-    #[track_caller]
-    pub fn panic<'a, E, Target>(
-        guard: PoisonGuard<'a, T, Target>,
-        payload: Box<dyn Any + Send + Sync + 'static>,
-    ) where
-        Target: ops::DerefMut<Target = Poison<T>> + 'a,
-    {
-        PoisonGuard::panic(guard, payload);
+        PoisonGuard::poison_with_error(guard, err);
     }
 
     /**
@@ -301,5 +299,25 @@ impl<T> Poison<T> {
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
     {
         PoisonGuard::unpoison_now(guard);
+    }
+
+    /**
+    Try recover a guard based on a result.
+    */
+    pub fn try_recover<Target, O, E>(
+        r: Result<O, E>,
+        guard: PoisonGuard<T, Target>,
+    ) -> Result<O, PoisonError>
+    where
+        E: Into<Box<dyn Error + Send + Sync>>,
+        Target: ops::DerefMut<Target = Poison<T>>,
+    {
+        match r {
+            Ok(ok) => {
+                PoisonGuard::unpoison_now(guard);
+                Ok(ok)
+            }
+            Err(err) => Err(PoisonGuard::poison_with_error(guard, err)),
+        }
     }
 }

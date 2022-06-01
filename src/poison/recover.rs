@@ -1,6 +1,16 @@
-use std::{error::Error, fmt, marker, ops};
+use std::{
+    error::Error,
+    fmt,
+    marker,
+    ops,
+    panic::UnwindSafe,
+};
 
-use super::{Poison, PoisonError, PoisonGuard};
+use super::{
+    Poison,
+    PoisonError,
+    PoisonGuard,
+};
 
 /**
 A guard for a poisoned value.
@@ -9,6 +19,11 @@ pub struct PoisonRecover<'a, T, Target = &'a mut Poison<T>> {
     target: Target,
     recover_to_poison_now: bool,
     _marker: marker::PhantomData<&'a mut T>,
+}
+
+impl<'a, T, Target> UnwindSafe for PoisonRecover<'a, T, Target> where
+    Target: ops::DerefMut<Target = Poison<T>>
+{
 }
 
 impl<'a, T, Target> PoisonRecover<'a, T, Target>

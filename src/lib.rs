@@ -1,8 +1,11 @@
 /*!
-Utilities for unwind-safety.
+Utilities for maintaining sane state in the presence of panics and failures.
 
 This library contains [`Poison<T>`], which can be used to detect when state may be poisoned by
 early returns, and to propagate errors and unwinds across threads that share state.
+
+Poisoning is a general strategy for keeping state consistent by blocking direct access if
+a previous user did something unexpected while using it.
 
 ## Detecting invalid state
 
@@ -159,11 +162,10 @@ poisoned by a panic (the poisoning guard was acquired at 'src/lib.rs:13:38')
 ```
 */
 
-pub mod guard;
-pub mod poison;
+mod poison;
 
 #[doc(inline)]
-pub use self::poison::Poison;
+pub use self::poison::*;
 
 #[cfg(test)]
 mod tests;

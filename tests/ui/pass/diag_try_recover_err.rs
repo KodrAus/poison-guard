@@ -1,23 +1,22 @@
-#![feature(backtrace)]
-
-use std::{iter, io, error::Error};
+use std::{error::Error, io, iter};
 
 use poison_guard::Poison;
 
 fn run() -> Result<(), Box<dyn Error + 'static>> {
     let mut p = Poison::new(42);
 
-    let mut s = Poison::scope(p.as_mut().poison().unwrap());
+    let mut g = Poison::unless_recovered(&mut p)?;
 
-    s.try_catch_unwind(|g| {
-        *g += 1;
+    let _ = Poison::try_recover(
+        (|| {
+            *g += 1;
 
-        panic!("explicit panic");
+            Err::<(), io::Error>(io::Error::new(io::ErrorKind::Interrupted, "an IO error"))
+        })(),
+        g,
+    );
 
-        Ok::<(), io::Error>(())
-    })?;
-
-    let g = s.poison()?;
+    let g = Poison::on_unwind(&mut p)?;
 
     assert_eq!(42, *g);
 
@@ -35,14 +34,8 @@ fn render(err: &(dyn Error + 'static)) {
     println!();
 
     println!("{}", err);
-    if let Some(bt) = err.backtrace() {
-        println!("{}", bt);
-    }
 
     for err in iter::successors(err.source(), |&err| err.source()) {
         println!("  caused by: {}", err);
-        if let Some(bt) = err.backtrace() {
-            println!("{}", bt);
-        }
     }
 }

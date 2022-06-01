@@ -1,4 +1,12 @@
-use std::{any::Any, borrow::Cow, error::Error, fmt, mem, panic::Location, sync::Arc};
+use std::{
+    any::Any,
+    borrow::Cow,
+    error::Error,
+    fmt,
+    mem,
+    panic::Location,
+    sync::Arc,
+};
 
 /**
 An error indicating that a value was poisoned.

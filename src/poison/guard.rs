@@ -1,6 +1,12 @@
-use std::any::Any;
-use std::error::Error;
-use std::{fmt, marker, ops, thread};
+use crate::poison::PoisonError;
+use std::{
+    error::Error,
+    fmt,
+    marker,
+    ops,
+    panic::UnwindSafe,
+    thread,
+};
 
 use super::Poison;
 
@@ -13,6 +19,11 @@ where
 {
     target: Target,
     _marker: marker::PhantomData<&'a mut T>,
+}
+
+impl<'a, T, Target> UnwindSafe for PoisonGuard<'a, T, Target> where
+    Target: ops::DerefMut<Target = Poison<T>>
+{
 }
 
 impl<'a, T, Target> PoisonGuard<'a, T, Target>
@@ -40,16 +51,12 @@ where
     }
 
     #[track_caller]
-    pub(super) fn err<E>(mut guard: Self, e: E)
+    pub(super) fn poison_with_error<E>(mut guard: Self, e: E) -> PoisonError
     where
         E: Into<Box<dyn Error + Send + Sync>>,
     {
         guard.target.state.poison_with_error(Some(e.into()));
-    }
-
-    #[track_caller]
-    pub(super) fn panic(mut guard: Self, p: Box<dyn Any + Send + Sync>) {
-        guard.target.state.poison_with_panic(Some(p));
+        guard.target.state.to_error()
     }
 
     #[track_caller]
