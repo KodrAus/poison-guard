@@ -1,4 +1,6 @@
-use std::{fmt, marker, mem, ops, ptr, thread};
+use std::any::Any;
+use std::error::Error;
+use std::{fmt, marker, ops, thread};
 
 use super::Poison;
 
@@ -18,8 +20,8 @@ where
     Target: ops::DerefMut<Target = Poison<T>>,
 {
     #[track_caller]
-    pub(super) fn new(mut target: Target) -> PoisonGuard<'a, T, Target> {
-        target.state.then_to_sentinel();
+    pub(super) fn poison_on_unwind(mut target: Target) -> PoisonGuard<'a, T, Target> {
+        target.state.guarded();
 
         PoisonGuard {
             target,
@@ -27,28 +29,45 @@ where
         }
     }
 
-    pub(super) fn take(mut guard: Self) -> Target {
-        let target = &mut guard.target as *mut Target;
+    #[track_caller]
+    pub(super) fn poison_now(mut target: Target) -> PoisonGuard<'a, T, Target> {
+        target.state.poison_with_error(None);
 
-        // Forgetting the struct itself here is ok, because the
-        // other fields of `PoisonGuard` don't require `Drop`
-        mem::forget(guard);
+        PoisonGuard {
+            target,
+            _marker: Default::default(),
+        }
+    }
 
-        // SAFETY: The target pointer is still valid
-        unsafe { ptr::read(target) }
+    #[track_caller]
+    pub(super) fn err<E>(mut guard: Self, e: E)
+    where
+        E: Into<Box<dyn Error + Send + Sync>>,
+    {
+        guard.target.state.poison_with_error(Some(e.into()));
+    }
+
+    #[track_caller]
+    pub(super) fn panic(mut guard: Self, p: Box<dyn Any + Send + Sync>) {
+        guard.target.state.poison_with_panic(Some(p));
+    }
+
+    #[track_caller]
+    pub(super) fn unpoison_now(mut guard: Self) {
+        guard.target.state.unpoison();
     }
 }
 
-impl<'a, T, Target> ops::Drop for PoisonGuard<'a, T, Target>
+impl<'a, T, Target> Drop for PoisonGuard<'a, T, Target>
 where
     Target: ops::DerefMut<Target = Poison<T>>,
 {
     #[track_caller]
     fn drop(&mut self) {
         if thread::panicking() {
-            self.target.state.then_to_panic(None);
+            self.target.state.poison_with_panic(None);
         } else {
-            self.target.state.then_to_unpoisoned();
+            self.target.state.unpoison_if_guarded();
         }
     }
 }

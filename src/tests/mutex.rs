@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 fn poisoning_mutex() {
     let mutex = Mutex::new(Poison::new(42));
 
-    let mut guard = mutex.lock().poison().unwrap();
+    let mut guard = Poison::on_unwind(mutex.lock()).unwrap();
 
     *guard = 43;
     drop(guard);
@@ -17,20 +17,18 @@ fn poisoning_mutex() {
 
     assert!(!guard.is_poisoned());
 
-    let guard = guard.poison().unwrap();
+    let guard = Poison::on_unwind(guard).unwrap();
     assert_eq!(43, *guard);
     drop(guard);
 
     // Poison the guard without deadlocking the mutex
     let _ = Poison::err(
-        mutex.lock().poison().unwrap(),
+        Poison::on_unwind(mutex.lock()).unwrap(),
         io::Error::from(io::ErrorKind::Other),
     );
 
-    let guard = mutex
-        .lock()
-        .poison()
-        .unwrap_or_else(|guard| guard.recover_with(|v| *v = 42));
+    let guard =
+        Poison::on_unwind(mutex.lock()).unwrap_or_else(|guard| guard.recover_with(|v| *v = 42));
 
     assert_eq!(42, *guard);
 }

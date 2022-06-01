@@ -2,9 +2,9 @@
 name = "poison-guard"
 version = "0.1.0"
 authors = ["Ashley Mannix <kodraus@hey.com>"]
-edition = "2018"
+edition = "2021"
 
-[dependencies.pin-project]
+[dev-dependencies.once_cell]
 version = "1"
 
 [dev-dependencies.anyhow]

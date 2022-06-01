@@ -11,7 +11,7 @@ fn poison_size() {
 fn unpoisoned_guard_can_access_value() {
     let mut v = Poison::new(42);
 
-    let mut guard = v.as_mut().poison().unwrap();
+    let mut guard = Poison::unless_recovered(&mut v).unwrap();
 
     assert_eq!(42, *guard);
     *guard += 1;
@@ -25,10 +25,10 @@ fn unpoisoned_guard_can_access_value() {
 fn guard_poisons_on_forget() {
     let mut p = Poison::new(42);
 
-    let g = p.as_mut().poison().unwrap();
+    let mut guard = Poison::on_unwind(&mut p).unwrap();
 
     // Forgetting a guard should poison
-    mem::forget(g);
+    mem::forget(guard);
 
     assert!(p.is_poisoned());
 }
@@ -38,7 +38,7 @@ fn guard_poisons_on_panic() {
     let mut v = Poison::new(42);
 
     let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let mut guard = v.as_mut().poison().unwrap();
+        let mut guard = Poison::on_unwind(&mut v).unwrap();
 
         *guard += 1;
 

@@ -2,6 +2,7 @@
 Unwind-safe containers.
 */
 
+use std::any::Any;
 use std::{
     error::Error,
     ops,
@@ -11,14 +12,8 @@ use std::{
 mod error;
 mod guard;
 mod recover;
-mod scope;
 
-pub use self::{
-    error::PoisonError,
-    guard::PoisonGuard,
-    recover::PoisonRecover,
-    scope::{PoisonScope, TryCatchUnwind},
-};
+pub use self::{error::PoisonError, guard::PoisonGuard, recover::PoisonRecover};
 
 use self::error::PoisonState;
 
@@ -42,7 +37,8 @@ impl<T> Poison<T> {
     Creating an unpoisoned value:
 
     ```
-    # use poison_guard::Poison;
+    use poison_guard::Poison;
+
     let mut value = Poison::new(42);
 
     // The value isn't poisoned, so we can access it
@@ -70,12 +66,11 @@ impl<T> Poison<T> {
     Using `Poison<T>` in a lazy static:
 
     ```
-    # #![feature(once_cell)]
-    # use poison_guard::Poison;
+    use once_cell::sync::Lazy;
+    use poison_guard::Poison;
+
     # fn some_failure_condition() -> bool { false }
     # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::lazy::SyncLazy as Lazy;
-
     static SHARED: Lazy<Poison<String>> = Lazy::new(|| Poison::new_catch_unwind(|| {
         let mut value = String::from("Hello");
 
@@ -124,10 +119,11 @@ impl<T> Poison<T> {
     Using `Poison<T>` in a lazy static:
 
     ```
-    # #![feature(once_cell)]
-    use std::{io, lazy::SyncLazy as Lazy};
+    use once_cell::sync::Lazy;
+    use std::io;
 
-    # use poison_guard::Poison;
+    use poison_guard::Poison;
+
     # fn check_some_things(s: &mut String) -> Result<bool, io::Error> { Ok(false) }
     # fn main() -> Result<(), Box<dyn std::error::Error>> {
     static SHARED: Lazy<Poison<String>> = Lazy::new(|| Poison::try_new_catch_unwind(|| {
@@ -188,11 +184,10 @@ impl<T> Poison<T> {
     Get the value of a potentially poisoned global value:
 
     ```
-    # #![feature(once_cell)]
-    # use poison_guard::Poison;
-    # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::lazy::SyncLazy as Lazy;
+    use once_cell::sync::Lazy;
+    use poison_guard::Poison;
 
+    # fn main() -> Result<(), Box<dyn std::error::Error>> {
     static SHARED: Lazy<Poison<i32>> = Lazy::new(|| Poison::new(42));
 
     let value = SHARED.get()?;
@@ -202,16 +197,16 @@ impl<T> Poison<T> {
     # }
     ```
     */
-    pub fn get<'a>(&'a self) -> Result<&'a T, PoisonRecover<'a, T, &'a Self>> {
+    pub fn get(&self) -> Result<&T, PoisonRecover<T, &Self>> {
         if self.is_poisoned() {
-            Err(PoisonRecover::new(self))
+            Err(PoisonRecover::recover_to_poison_on_unwind(self))
         } else {
             Ok(&self.value)
         }
     }
 
     /**
-    Try poison the value and return a guard to it.
+    Get a guard to the value that will only poison if a panic unwinds through the guard.
 
     When the guard is dropped the value will be unpoisoned, unless a panic unwound through it.
 
@@ -236,125 +231,75 @@ impl<T> Poison<T> {
 
     let mutex = Mutex::new(Poison::new(42));
 
-    let guard = mutex.lock().poison().unwrap();
+    let guard = Poison::on_unwind(mutex.lock()).unwrap();
 
     assert_eq!(42, *guard);
     ```
     */
-    #[track_caller]
-    pub fn poison<'a, Target>(
-        self: Target,
+    pub fn on_unwind<'a, Target>(
+        poison: Target,
     ) -> Result<PoisonGuard<'a, T, Target>, PoisonRecover<'a, T, Target>>
     where
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
     {
-        if self.is_poisoned() {
-            Err(PoisonRecover::new(self))
+        if poison.is_poisoned() {
+            Err(PoisonRecover::recover_to_poison_on_unwind(poison))
         } else {
-            Ok(PoisonGuard::new(self))
+            Ok(PoisonGuard::poison_on_unwind(poison))
         }
     }
 
     /**
-    Convert a guard into a scope.
 
-    Scopes can be used to catch panics or errors that are encountered while using a value.
-
-    ## Examples
-
-    Creating a synchronous scope:
-
-    ```
-    # use std::io;
-    # use poison_guard::Poison;
-    # fn err_too_big() -> io::Error { io::ErrorKind::Other.into() }
-    # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut p = Poison::new(1);
-
-    let mut scope = Poison::scope(p.as_mut().poison()?);
-
-    scope.try_catch_unwind(|v| {
-        *v += 1;
-
-        if *v > 10 {
-            Err(err_too_big())
-        } else {
-            Ok(())
-        }
-    })?;
-
-    let mut guard = scope.poison()?;
-
-    assert_eq!(2, *guard);
-    # Ok(())
-    # }
-    ```
-
-    Creating an asynchronous scope:
-
-    ```
-    # use std::io;
-    # use poison_guard::Poison;
-    # fn err_too_big() -> io::Error { io::ErrorKind::Other.into() }
-    # async fn some_other_work(i: &mut i32) -> Result<(), io::Error> { Err(io::ErrorKind::Other.into()) }
-    # fn main() {}
-    # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut p = Poison::new(1);
-
-    let mut scope = Poison::scope(p.as_mut().poison()?);
-
-    scope.try_catch_unwind(|v| async move {
-        *v += 1;
-
-        some_other_work(v).await?;
-
-        if *v > 10 {
-            Err(err_too_big())
-        } else {
-            Ok(())
-        }
-    }).await?;
-
-    let mut guard = scope.poison()?;
-
-    assert_eq!(2, *guard);
-    # Ok(())
-    # }
-    ```
     */
-    #[track_caller]
-    pub fn scope<'a, Target>(guard: PoisonGuard<'a, T, Target>) -> PoisonScope<'a, T, Target>
+    pub fn unless_recovered<'a, Target>(
+        poison: Target,
+    ) -> Result<PoisonGuard<'a, T, Target>, PoisonRecover<'a, T, Target>>
     where
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
     {
-        let target = PoisonGuard::take(guard);
-
-        PoisonScope::<T, Target>::new(target)
+        if poison.is_poisoned() {
+            Err(PoisonRecover::recover_to_poison_now(poison))
+        } else {
+            Ok(PoisonGuard::poison_now(poison))
+        }
     }
 
     /**
     Poison a guard explicitly with an error.
-
     It's not usually necessary to poison a guard manually.
     */
     #[track_caller]
-    pub fn err<'a, E, Target>(
-        guard: PoisonGuard<'a, T, Target>,
-        e: E,
-    ) -> PoisonRecover<'a, T, Target>
+    pub fn err<'a, E, Target>(guard: PoisonGuard<'a, T, Target>, err: E)
     where
         E: Into<Box<dyn Error + Send + Sync>>,
         Target: ops::DerefMut<Target = Poison<T>> + 'a,
     {
-        let mut target = PoisonGuard::take(guard);
-        target.state.then_to_err(Some(e.into()));
-
-        PoisonRecover::new(target)
+        PoisonGuard::err(guard, err);
     }
-}
 
-impl<T> AsMut<Poison<T>> for Poison<T> {
-    fn as_mut(&mut self) -> &mut Self {
-        self
+    /**
+    Poison a guard explicitly with a panic payload.
+    */
+    #[track_caller]
+    pub fn panic<'a, E, Target>(
+        guard: PoisonGuard<'a, T, Target>,
+        payload: Box<dyn Any + Send + Sync + 'static>,
+    ) where
+        Target: ops::DerefMut<Target = Poison<T>> + 'a,
+    {
+        PoisonGuard::panic(guard, payload);
+    }
+
+    /**
+    Recover a guard, unpoisoning it if it was poisoned.
+
+    This method must be used to recover guards acquired through [`Poison::unless_recovered`].
+    */
+    pub fn recover<'a, Target>(guard: PoisonGuard<'a, T, Target>)
+    where
+        Target: ops::DerefMut<Target = Poison<T>> + 'a,
+    {
+        PoisonGuard::unpoison_now(guard);
     }
 }

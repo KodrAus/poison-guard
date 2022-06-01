@@ -84,7 +84,7 @@ impl Writer {
             Ok::<(), anyhow::Error>(())
         })?;
 
-        // Let the guar fall out of scope, this will unpoison the value so future
+        // Let the guard fall out of scope, this will unpoison the value so future
         // callers can come along and use it
         Ok(())
     }
@@ -158,18 +158,6 @@ The above example will output something like:
 poisoned by a panic (the poisoning guard was acquired at 'src/lib.rs:13:38')
 ```
 */
-
-#![feature(
-    async_closure,
-    backtrace,
-    once_cell,
-    arbitrary_self_types,
-    try_trait,
-    ready_macro
-)]
-
-#[macro_use]
-extern crate pin_project;
 
 pub mod guard;
 pub mod poison;
