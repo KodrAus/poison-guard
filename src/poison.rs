@@ -5,22 +5,14 @@ Unwind-safe containers.
 use std::{
     error::Error,
     ops,
-    panic::{
-        self,
-        Location,
-        RefUnwindSafe,
-    },
+    panic::{self, Location, RefUnwindSafe},
 };
 
 mod error;
 mod guard;
 mod recover;
 
-pub use self::{
-    error::PoisonError,
-    guard::PoisonGuard,
-    recover::PoisonRecover,
-};
+pub use self::{error::PoisonError, guard::PoisonGuard, recover::PoisonRecover};
 
 use self::error::PoisonState;
 
@@ -484,6 +476,7 @@ impl<T> Poison<T> {
     # }
     ```
     */
+    #[track_caller]
     pub fn try_recover<Target, O, E>(
         r: Result<O, E>,
         guard: PoisonGuard<T, Target>,
