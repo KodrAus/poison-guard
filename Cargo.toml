@@ -2,7 +2,12 @@
 name = "poison-guard"
 version = "0.1.0"
 authors = ["Ashley Mannix <kodraus@hey.com>"]
+license = "MIT OR Apache-2.0"
 edition = "2021"
+description = "Utilities for maintaining sane state in the presence of panics and failures."
+documentation = "https://docs.rs/poison-guard"
+keywords = ["poison", "guard"]
+categories = ["rust-patterns"]
 
 [dev-dependencies.once_cell]
 version = "1"

@@ -1,5 +1,5 @@
 /*!
-c
+Utilities for maintaining sane state in the presence of panics and other failures.
 
 This library contains [`Poison<T>`], which implements poisoning independently of locks or
 other mechanisms for sharing state.

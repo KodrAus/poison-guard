@@ -3,36 +3,44 @@
 Utilities for maintaining sane state in the presence of panics and failures.
 It's a bit like the [`poison`](https://github.com/reem/rust-poison) and [`with_drop`](https://github.com/koraa/with_drop/) crates.
 
+## What is poisoning?
+
+Poisoning is a general strategy for keeping state consistent by blocking direct access to state if a previous user did something unexpected with it.
+
 ## Use cases
 
-The `Poison<T>` type is intended to be used in synchronization primitives to standardize their poisoning behavior in the presence of unwinds.
+- You have some external resource, like a `File`, that might become corrupted, and you want to know about it.
+- You're sharing some state across threads, and you want any panics that happen while sharing to propagate.
+- You're using a non-poisoning container (like `once_cell::sync::Lazy` or `parking_lot::Mutex`) and want to add poisoning to them.
 
-For `Mutex`, that means detecting panics that unwind through a lock and giving users a chance to recover from them:
+## Getting started
 
-```rust
-// In Mutex<T>
+Add `poison-guard` to your `Cargo.toml`:
 
-let mutex: Mutex<Poison<i32>> = Mutex::new(Poison::new(42));
-
-assert_eq!(42, *Poison::on_unwind(mutex.lock()).unwrap());
+```toml
+[dependencies.poison-guard]
+version = "0.1.0"
 ```
 
-For `SyncLazy`, that means catching panics that would cause global initialization to fail and surfacing them:
+Then wrap your state in a `Poison<T>`:
 
 ```rust
-// In Lazy<T>
+use poison_guard::Poison;
 
-static LAZY: SyncLazy<Poison<i32>> = SyncLazy::new(|| Poison::new_catch_unwind(|| {
-    if some_failure_condition {
-        panic!("oh no!");
-    }
-
-    42
-}));
-
-if !LAZY.is_poisoned() {
-    assert_eq!(42, *LAZY.get().unwrap());
+pub struct MyData {
+    state: Poison<MyState>,
 }
 ```
 
-`Poison<T>` retains some context about how the guard was originally poisoned for future callers. If a poisoned guard is propagated across threads it offers some better debug information than what you'd get with a plain panic.
+When you want to access your state, you can acquire a poison guard:
+
+```rust
+let mut guard = Poison::on_unwind(&mut my_data.state).unwrap();
+
+do_something_with_state(&mut guard);
+```
+
+If a panic unwinds through a poison guard it'll panic the value, blocking future callers from accessing it. Poisoned
+values can be recovered, or the original failure can be propagated to those future callers.
+
+For more details, see the documentation.
