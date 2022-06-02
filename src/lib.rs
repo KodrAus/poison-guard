@@ -1,20 +1,37 @@
 /*!
-Utilities for unwind-safety.
+Utilities for maintaining sane state in the presence of panics and other failures.
 
-This library contains [`Poison<T>`], which can be used to detect when state may be poisoned by
-early returns, and to propagate errors and unwinds across threads that share state.
+This library contains [`Poison<T>`], which implements poisoning independently of locks or
+other mechanisms for sharing state.
+
+## What is poisoning?
+
+Poisoning is a general strategy for keeping state consistent by blocking direct access to
+state if a previous user did something unexpected with it.
+
+Rust implements poisoning in the standard library's `Mutex<T>` type. This library offers poisoning
+without assuming locks. The standard library's poisoning is only concerned with panics, because
+they don't have an in-band signal like `?` to suggest an early return from a block of code is possible.
+Code may not be written to expect panics. Poisoning offers a general solution for such code.
+
+The `Poison<T>` in this library also supports poisoning for other exceptional circumstances besides
+panics. Poisoning can be applied anywhere there's complex state management at play, but is particularly
+useful for cordoning off external resources, like files, that may become corrupted without panicking.
 
 ## Detecting invalid state
 
-In simple cases, we can just access a value, and if a panic occurs the value will be poisoned:
+In simple cases, we can just access a value, and if a panic occurs the value will be poisoned.
+This example defines an `Account`, with an invariant that the total balance is always equal to
+the sum of its changes. We can protect this invariant using `Poison<T>`:
 
 ```
-# use poison_guard::Poison;
+use poison_guard::Poison;
+
 struct Account(Poison<AccountState>);
 
 struct AccountState {
-    // The total _must_ be the sum of all changes
     total: i64,
+    // Invariant: the total must be the sum of the changes
     changes: Vec<i64>,
 }
 
@@ -24,16 +41,30 @@ impl Account {
     }
 
     pub fn push_change(&mut self, change: i64) {
-        let mut state = self.0.as_mut().poison().unwrap();
+        // In order to access our `AccountState` we need to get a poison guard
+        let mut state = match Poison::on_unwind(&mut self.0) {
+            // If our state was not poisoned then we can work with it
+            Ok(state) => state,
+            // If our state was poisoned then try to restore our invariant
+            // After that we'll be able to use it again
+            Err(poisoned) => poisoned.recover_with(|state| {
+                state.total = state.changes.iter().sum();
+            })
+        };
 
+        // Make some updates to the state
         state.changes.push(change);
 
-        // If we panic here, our state will poison
-        // The total won't be the sum of all changes, but that's ok
-        // Future callers won't be able to access the state without
-        // attempting to recover it first
+        // If we panic here then our state is invalid.
+        // The `Poison::on_unwind` call above will start
+        // to panic rather than letting us continue to access
+        // the broken state
 
-        state.total = state.changes.iter().copied().sum();
+        state.total += change;
+
+        // At this point the guard falls out of scope and the
+        // state is considered valid. Future callers will
+        // succeed when they call `Poison::on_unwind`
     }
 
     pub fn total(&self) -> i64 {
@@ -42,11 +73,12 @@ impl Account {
 }
 ```
 
-Say we're writing data to a file. If an individual write fails we might not know exactly what state
-the file has been left in on-disk and need to recover it before accessing again:
+More complex usecases may need to poison in other cases besides panics. Say we're writing data to a file.
+If an individual write fails we might not know exactly what state the file has been left in on-disk
+and need to recover it before accessing again:
 
 ```
-# use poison_guard::Poison;
+use poison_guard::Poison;
 use anyhow::Error;
 use std::{io::{self, Write}, fs::File};
 
@@ -61,31 +93,25 @@ struct Data {
 
 impl Writer {
     pub fn write_data(&mut self, data: Data) -> anyhow::Result<()> {
-        let file = self
-            .file
-            .as_mut()
-            .poison()
-            .or_else(|guard| {
+        // Acquire a guard for our state that will only be unpoisoned
+        // if we explicitly recover it
+        let mut file = Poison::unless_recovered(&mut self.file)
+            .or_else(|poisoned| {
                 // If the value was poisoned, we'll try recover it
-                // This means some past user either panicked or explicitly
-                // poisoned the value
-                guard.try_recover_with(|file| Writer::check_and_fix(file))
+                // Maybe one of our previous writes partially failed?
+                poisoned.try_recover_with(|file| Writer::check_and_fix(file))
             })
-            .map_err(|guard| guard.into_error())?;
+            .map_err(|poisoned| poisoned.into_error())?;
 
-        // Now that we have access to the value, we can create a scope over it
-        // Within this scope, any panic or early return from `?` will poison the value
-        let mut scope = Poison::scope(file);
+        // Now that we have access to the value, we can interact with it
+        Writer::write_data_header(&mut file, data.id, data.payload.len() as u64)?;
+        Writer::write_data_payload(&mut file, data.payload)?;
 
-        scope.try_catch_unwind(|file| {
-            Writer::write_data_header(file, data.id, data.payload.len() as u64)?;
-            Writer::write_data_payload(file, data.payload)?;
+        // Return the guard, unpoisoning the value
+        // If we early return through a panic or `?` before we get here
+        // then the guard will remain poisoned
+        Poison::recover(file);
 
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        // Let the guar fall out of scope, this will unpoison the value so future
-        // callers can come along and use it
         Ok(())
     }
 
@@ -114,9 +140,10 @@ impl Writer {
 If a `Poison<T>` is poisoned, future attempts to access it may convert that into a panic or error:
 
 ```should_panic
-# use poison_guard::Poison;
-# use std::{sync::Arc, thread};
-# use parking_lot::Mutex;
+use poison_guard::Poison;
+use std::{sync::Arc, thread};
+use parking_lot::Mutex;
+
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mutex = Arc::new(Mutex::new(Poison::new(String::from("a value!"))));
 
@@ -124,7 +151,7 @@ let mutex = Arc::new(Mutex::new(Poison::new(String::from("a value!"))));
 # let h = {
 # let mutex = mutex.clone();
 thread::spawn(move || {
-    let mut guard = mutex.lock().poison().unwrap();
+    let mut guard = Poison::on_unwind(mutex.lock()).unwrap();
 
     guard.push_str("And some more!");
 
@@ -138,7 +165,7 @@ thread::spawn(move || {
 // Later, we try access the poison
 // If it was poisoned we'll get a guard that can be
 // recovered, unwrapped or converted into an error
-match mutex.lock().poison() {
+match Poison::on_unwind(mutex.lock()) {
     Ok(guard) => {
         println!("the value is: {}", &*guard);
     }
@@ -159,23 +186,10 @@ poisoned by a panic (the poisoning guard was acquired at 'src/lib.rs:13:38')
 ```
 */
 
-#![feature(
-    async_closure,
-    backtrace,
-    once_cell,
-    arbitrary_self_types,
-    try_trait,
-    ready_macro
-)]
-
-#[macro_use]
-extern crate pin_project;
-
-pub mod guard;
-pub mod poison;
+mod poison;
 
 #[doc(inline)]
-pub use self::poison::Poison;
+pub use self::poison::*;
 
 #[cfg(test)]
 mod tests;

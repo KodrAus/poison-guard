@@ -1,6 +1,4 @@
-#![feature(backtrace)]
-
-use std::{iter, error::Error};
+use std::{error::Error, iter};
 
 use poison_guard::Poison;
 
@@ -9,7 +7,7 @@ fn run() -> Result<(), Box<dyn Error + 'static>> {
         panic!("explicit panic");
     });
 
-    let g = p.as_mut().poison()?;
+    let g = Poison::on_unwind(&mut p)?;
 
     assert_eq!(42, *g);
 
@@ -27,14 +25,8 @@ fn render(err: &(dyn Error + 'static)) {
     println!();
 
     println!("{}", err);
-    if let Some(bt) = err.backtrace() {
-        println!("{}", bt);
-    }
 
     for err in iter::successors(err.source(), |&err| err.source()) {
         println!("  caused by: {}", err);
-        if let Some(bt) = err.backtrace() {
-            println!("{}", bt);
-        }
     }
 }

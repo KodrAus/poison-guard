@@ -1,5 +1,11 @@
 use std::{
-    any::Any, backtrace::Backtrace, borrow::Cow, error::Error, fmt, mem, panic::Location, sync::Arc,
+    any::Any,
+    borrow::Cow,
+    error::Error,
+    fmt,
+    mem,
+    panic::Location,
+    sync::Arc,
 };
 
 /**
@@ -24,10 +30,6 @@ impl Error for PoisonError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Error::source(&self.0)
     }
-
-    fn backtrace(&self) -> Option<&Backtrace> {
-        Error::backtrace(&self.0)
-    }
 }
 
 #[derive(Clone)]
@@ -39,29 +41,25 @@ enum PoisonStateInner {
     UnknownPanic(Arc<UnknownPanic>),
     CapturedErr(Arc<CapturedErr>),
     UnknownErr(Arc<UnknownErr>),
-    Sentinel(&'static Location<'static>),
+    Guarded(&'static Location<'static>),
     Unpoisoned,
 }
 
 struct CapturedPanic {
-    backtrace: Backtrace,
     location: &'static Location<'static>,
     payload: Cow<'static, str>,
 }
 
 struct UnknownPanic {
-    backtrace: Backtrace,
     location: &'static Location<'static>,
 }
 
 struct CapturedErr {
-    backtrace: Backtrace,
     location: &'static Location<'static>,
     source: Box<dyn Error + Send + Sync>,
 }
 
 struct UnknownErr {
-    backtrace: Backtrace,
     location: &'static Location<'static>,
 }
 
@@ -76,15 +74,11 @@ impl PoisonState {
     ) -> Self {
         PoisonState(if let Some(err) = err {
             PoisonStateInner::CapturedErr(Arc::new(CapturedErr {
-                backtrace: Backtrace::capture(),
                 location,
                 source: err,
             }))
         } else {
-            PoisonStateInner::UnknownErr(Arc::new(UnknownErr {
-                backtrace: Backtrace::capture(),
-                location,
-            }))
+            PoisonStateInner::UnknownErr(Arc::new(UnknownErr { location }))
         })
     }
 
@@ -106,26 +100,22 @@ impl PoisonState {
 
         PoisonState(if let Some(panic) = panic {
             PoisonStateInner::CapturedPanic(Arc::new(CapturedPanic {
-                backtrace: Backtrace::capture(),
                 location,
                 payload: panic,
             }))
         } else {
-            PoisonStateInner::UnknownPanic(Arc::new(UnknownPanic {
-                backtrace: Backtrace::capture(),
-                location,
-            }))
+            PoisonStateInner::UnknownPanic(Arc::new(UnknownPanic { location }))
         })
     }
 
     #[track_caller]
-    pub(super) fn then_to_sentinel(&mut self) {
-        *self = PoisonState(PoisonStateInner::Sentinel(Location::caller()))
+    pub(super) fn guarded(&mut self) {
+        *self = PoisonState(PoisonStateInner::Guarded(Location::caller()))
     }
 
     #[track_caller]
-    pub(super) fn then_to_err(&mut self, err: Option<Box<dyn Error + Send + Sync>>) {
-        let location = if let PoisonStateInner::Sentinel(location) = self.0 {
+    pub(super) fn poison_with_error(&mut self, err: Option<Box<dyn Error + Send + Sync>>) {
+        let location = if let PoisonStateInner::Guarded(location) = self.0 {
             location
         } else {
             Location::caller()
@@ -135,8 +125,8 @@ impl PoisonState {
     }
 
     #[track_caller]
-    pub(super) fn then_to_panic(&mut self, panic: Option<Box<dyn Any + Send>>) {
-        let location = if let PoisonStateInner::Sentinel(location) = self.0 {
+    pub(super) fn poison_with_panic(&mut self, panic: Option<Box<dyn Any + Send>>) {
+        let location = if let PoisonStateInner::Guarded(location) = self.0 {
             location
         } else {
             Location::caller()
@@ -146,17 +136,15 @@ impl PoisonState {
     }
 
     #[track_caller]
-    pub(super) fn then_to_unpoisoned(&mut self) {
-        if let PoisonStateInner::Sentinel(_) = self.0 {
+    pub(super) fn unpoison_if_guarded(&mut self) {
+        if let PoisonStateInner::Guarded(_) = self.0 {
             *self = PoisonState::from_unpoisoned();
         }
     }
 
-    pub(super) fn is_unpoisoned_or_sentinel(&self) -> bool {
-        matches!(
-            self.0,
-            PoisonStateInner::Unpoisoned | PoisonStateInner::Sentinel(_)
-        )
+    #[track_caller]
+    pub(super) fn unpoison(&mut self) {
+        *self = PoisonState::from_unpoisoned();
     }
 
     pub(super) fn is_unpoisoned(&self) -> bool {
@@ -203,7 +191,7 @@ impl fmt::Debug for PoisonStateInner {
                 .field(&"err", &"<unknown>")
                 .field(&"location", &err.location)
                 .finish(),
-            PoisonStateInner::Sentinel(location) => f
+            PoisonStateInner::Guarded(location) => f
                 .debug_struct("PoisonState")
                 .field(&"location", &location)
                 .finish(),
@@ -237,7 +225,7 @@ impl fmt::Display for PoisonStateInner {
                 "poisoned by an error (the poisoning guard was acquired at '{}')",
                 err.location
             ),
-            PoisonStateInner::Sentinel(location) => write!(
+            PoisonStateInner::Guarded(location) => write!(
                 f,
                 "poisoned (the poisoning guard was acquired at '{}')",
                 location
@@ -253,16 +241,6 @@ impl Error for PoisonStateInner {
             Some(&*err.source)
         } else {
             None
-        }
-    }
-
-    fn backtrace(&self) -> Option<&Backtrace> {
-        match self {
-            PoisonStateInner::CapturedErr(ref err) => Some(&err.backtrace),
-            PoisonStateInner::CapturedPanic(ref panic) => Some(&panic.backtrace),
-            PoisonStateInner::UnknownErr(ref err) => Some(&err.backtrace),
-            PoisonStateInner::UnknownPanic(ref panic) => Some(&panic.backtrace),
-            _ => None,
         }
     }
 }

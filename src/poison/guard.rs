@@ -1,4 +1,12 @@
-use std::{fmt, marker, mem, ops, ptr, thread};
+use crate::poison::PoisonError;
+use std::{
+    error::Error,
+    fmt,
+    marker,
+    ops,
+    panic::UnwindSafe,
+    thread,
+};
 
 use super::Poison;
 
@@ -13,13 +21,18 @@ where
     _marker: marker::PhantomData<&'a mut T>,
 }
 
+impl<'a, T, Target> UnwindSafe for PoisonGuard<'a, T, Target> where
+    Target: ops::DerefMut<Target = Poison<T>>
+{
+}
+
 impl<'a, T, Target> PoisonGuard<'a, T, Target>
 where
     Target: ops::DerefMut<Target = Poison<T>>,
 {
     #[track_caller]
-    pub(super) fn new(mut target: Target) -> PoisonGuard<'a, T, Target> {
-        target.state.then_to_sentinel();
+    pub(super) fn poison_on_unwind(mut target: Target) -> PoisonGuard<'a, T, Target> {
+        target.state.guarded();
 
         PoisonGuard {
             target,
@@ -27,28 +40,41 @@ where
         }
     }
 
-    pub(super) fn take(mut guard: Self) -> Target {
-        let target = &mut guard.target as *mut Target;
+    #[track_caller]
+    pub(super) fn poison_now(mut target: Target) -> PoisonGuard<'a, T, Target> {
+        target.state.poison_with_error(None);
 
-        // Forgetting the struct itself here is ok, because the
-        // other fields of `PoisonGuard` don't require `Drop`
-        mem::forget(guard);
+        PoisonGuard {
+            target,
+            _marker: Default::default(),
+        }
+    }
 
-        // SAFETY: The target pointer is still valid
-        unsafe { ptr::read(target) }
+    #[track_caller]
+    pub(super) fn poison_with_error<E>(mut guard: Self, e: E) -> PoisonError
+    where
+        E: Into<Box<dyn Error + Send + Sync>>,
+    {
+        guard.target.state.poison_with_error(Some(e.into()));
+        guard.target.state.to_error()
+    }
+
+    #[track_caller]
+    pub(super) fn unpoison_now(mut guard: Self) {
+        guard.target.state.unpoison();
     }
 }
 
-impl<'a, T, Target> ops::Drop for PoisonGuard<'a, T, Target>
+impl<'a, T, Target> Drop for PoisonGuard<'a, T, Target>
 where
     Target: ops::DerefMut<Target = Poison<T>>,
 {
     #[track_caller]
     fn drop(&mut self) {
         if thread::panicking() {
-            self.target.state.then_to_panic(None);
+            self.target.state.poison_with_panic(None);
         } else {
-            self.target.state.then_to_unpoisoned();
+            self.target.state.unpoison_if_guarded();
         }
     }
 }

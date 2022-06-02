@@ -1,13 +1,29 @@
-use std::{error::Error, fmt, marker, ops};
+use std::{
+    error::Error,
+    fmt,
+    marker,
+    ops,
+    panic::UnwindSafe,
+};
 
-use super::{Poison, PoisonError, PoisonGuard};
+use super::{
+    Poison,
+    PoisonError,
+    PoisonGuard,
+};
 
 /**
 A guard for a poisoned value.
 */
 pub struct PoisonRecover<'a, T, Target = &'a mut Poison<T>> {
     target: Target,
+    recover_to_poison_now: bool,
     _marker: marker::PhantomData<&'a mut T>,
+}
+
+impl<'a, T, Target> UnwindSafe for PoisonRecover<'a, T, Target> where
+    Target: ops::DerefMut<Target = Poison<T>>
+{
 }
 
 impl<'a, T, Target> PoisonRecover<'a, T, Target>
@@ -22,7 +38,7 @@ where
     */
     #[track_caller]
     pub fn recover(self) -> PoisonGuard<'a, T, Target> {
-        PoisonGuard::new(self.target)
+        PoisonGuard::poison_on_unwind(self.target)
     }
 
     /**
@@ -34,7 +50,11 @@ where
     pub fn recover_with(mut self, f: impl FnOnce(&mut T)) -> PoisonGuard<'a, T, Target> {
         f(&mut self.target.value);
 
-        PoisonGuard::new(self.target)
+        if self.recover_to_poison_now {
+            PoisonGuard::poison_now(self.target)
+        } else {
+            PoisonGuard::poison_on_unwind(self.target)
+        }
     }
 
     /**
@@ -51,13 +71,21 @@ where
         E: Into<Box<dyn Error + Send + Sync>>,
     {
         match f(&mut self.target.value) {
+            // The guard was recovered, return it
             Ok(()) => {
-                self.target.state.then_to_unpoisoned();
+                if self.recover_to_poison_now {
+                    Ok(PoisonGuard::poison_now(self.target))
+                } else {
+                    self.target.state.unpoison_if_guarded();
 
-                Ok(PoisonGuard::new(self.target))
+                    Ok(PoisonGuard::poison_on_unwind(self.target))
+                }
             }
+            // The guard was not recovered, we set it to an errored state
+            // If the guard was previously poisoned for a different reason
+            // this will replace it
             Err(e) => {
-                self.target.state.then_to_err(Some(e.into()));
+                self.target.state.poison_with_error(Some(e.into()));
 
                 Err(self)
             }
@@ -76,9 +104,18 @@ impl<'a, T, Target> PoisonRecover<'a, T, Target>
 where
     Target: ops::Deref<Target = Poison<T>>,
 {
-    pub(super) fn new(target: Target) -> PoisonRecover<'a, T, Target> {
+    pub(super) fn recover_to_poison_on_unwind(target: Target) -> PoisonRecover<'a, T, Target> {
         PoisonRecover {
             target,
+            recover_to_poison_now: false,
+            _marker: Default::default(),
+        }
+    }
+
+    pub(super) fn recover_to_poison_now(target: Target) -> PoisonRecover<'a, T, Target> {
+        PoisonRecover {
+            target,
+            recover_to_poison_now: true,
             _marker: Default::default(),
         }
     }
