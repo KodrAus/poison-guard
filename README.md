@@ -1,5 +1,9 @@
 # `poison-guard`
 
+[![Rust](https://github.com/KodrAus/poison-guard/actions/workflows/rust.yml/badge.svg)](https://github.com/KodrAus/poison-guard/actions/workflows/rust.yml)
+[![Latest version](https://img.shields.io/crates/v/poison-guard.svg)](https://crates.io/crates/poison-guard)
+[![Documentation](https://docs.rs/poison-guard/badge.svg)](https://docs.rs/poison-guard)
+
 Utilities for maintaining sane state in the presence of panics and failures.
 It's a bit like the [`poison`](https://github.com/reem/rust-poison) and [`with_drop`](https://github.com/koraa/with_drop/) crates.
 
