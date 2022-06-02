@@ -1,4 +1,8 @@
-use std::{iter, sync::Arc, thread};
+use std::{
+    iter,
+    sync::Arc,
+    thread,
+};
 
 use parking_lot::Mutex;
 use poison_guard::Poison;

@@ -1,18 +1,21 @@
 /*!
 Utilities for maintaining sane state in the presence of panics and failures.
 
-This library contains [`Poison<T>`], which can be used to detect when state may be poisoned by
-early returns, and to propagate errors and unwinds across threads that share state.
+This library contains [`Poison<T>`], which implements poisoning independently of locks or
+other mechanisms for sharing state.
 
-Poisoning is a general strategy for keeping state consistent by blocking direct access if
-a previous user did something unexpected while using it.
+## What is poisoning?
+
+Poisoning is a general strategy for keeping state consistent by blocking direct access to
+state if a previous user did something unexpected with it.
 
 ## Detecting invalid state
 
 In simple cases, we can just access a value, and if a panic occurs the value will be poisoned:
 
 ```
-# use poison_guard::Poison;
+use poison_guard::Poison;
+
 struct Account(Poison<AccountState>);
 
 struct AccountState {
@@ -27,7 +30,7 @@ impl Account {
     }
 
     pub fn push_change(&mut self, change: i64) {
-        let mut state = self.0.as_mut().poison().unwrap();
+        let mut state = Poison::on_unwind(&mut self.0).unwrap();
 
         state.changes.push(change);
 
@@ -49,7 +52,7 @@ Say we're writing data to a file. If an individual write fails we might not know
 the file has been left in on-disk and need to recover it before accessing again:
 
 ```
-# use poison_guard::Poison;
+use poison_guard::Poison;
 use anyhow::Error;
 use std::{io::{self, Write}, fs::File};
 
@@ -64,31 +67,26 @@ struct Data {
 
 impl Writer {
     pub fn write_data(&mut self, data: Data) -> anyhow::Result<()> {
-        let file = self
-            .file
-            .as_mut()
-            .poison()
-            .or_else(|guard| {
+        // Acquire a guard for our state that will only be unpoisoned
+        // if we explicitly recover it
+        let mut file = Poison::unless_recovered(&mut self.file)
+            .or_else(|poisoned| {
                 // If the value was poisoned, we'll try recover it
                 // This means some past user either panicked or explicitly
                 // poisoned the value
-                guard.try_recover_with(|file| Writer::check_and_fix(file))
+                poisoned.try_recover_with(|file| Writer::check_and_fix(file))
             })
-            .map_err(|guard| guard.into_error())?;
+            .map_err(|poisoned| poisoned.into_error())?;
 
-        // Now that we have access to the value, we can create a scope over it
-        // Within this scope, any panic or early return from `?` will poison the value
-        let mut scope = Poison::scope(file);
+        // Now that we have access to the value, we can interact with it
+        Writer::write_data_header(&mut file, data.id, data.payload.len() as u64)?;
+        Writer::write_data_payload(&mut file, data.payload)?;
 
-        scope.try_catch_unwind(|file| {
-            Writer::write_data_header(file, data.id, data.payload.len() as u64)?;
-            Writer::write_data_payload(file, data.payload)?;
+        // Return the guard, unpoisoning the value
+        // If we early return through a panic or `?` before we get here
+        // then the guard will remain poisoned
+        Poison::recover(file);
 
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        // Let the guard fall out of scope, this will unpoison the value so future
-        // callers can come along and use it
         Ok(())
     }
 
@@ -117,9 +115,10 @@ impl Writer {
 If a `Poison<T>` is poisoned, future attempts to access it may convert that into a panic or error:
 
 ```should_panic
-# use poison_guard::Poison;
-# use std::{sync::Arc, thread};
-# use parking_lot::Mutex;
+use poison_guard::Poison;
+use std::{sync::Arc, thread};
+use parking_lot::Mutex;
+
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mutex = Arc::new(Mutex::new(Poison::new(String::from("a value!"))));
 
@@ -127,7 +126,7 @@ let mutex = Arc::new(Mutex::new(Poison::new(String::from("a value!"))));
 # let h = {
 # let mutex = mutex.clone();
 thread::spawn(move || {
-    let mut guard = mutex.lock().poison().unwrap();
+    let mut guard = Poison::on_unwind(mutex.lock()).unwrap();
 
     guard.push_str("And some more!");
 
@@ -141,7 +140,7 @@ thread::spawn(move || {
 // Later, we try access the poison
 // If it was poisoned we'll get a guard that can be
 // recovered, unwrapped or converted into an error
-match mutex.lock().poison() {
+match Poison::on_unwind(mutex.lock()) {
     Ok(guard) => {
         println!("the value is: {}", &*guard);
     }
