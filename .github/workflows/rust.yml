@@ -19,15 +19,3 @@ jobs:
       with:
         command: test
         args: --verbose
-
-  miri:
-
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: nightly-2021-02-08
-    - run: rustup component add miri
-    - run: cargo clean; cargo miri test --lib --verbose

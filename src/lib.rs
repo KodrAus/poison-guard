@@ -9,6 +9,11 @@ other mechanisms for sharing state.
 Poisoning is a general strategy for keeping state consistent by blocking direct access to
 state if a previous user did something unexpected with it.
 
+Poisoning can be applied anywhere there's complex state management at play, but is particularly
+useful for cordoning off external resources, like files, that may become corrupted. Rust implements
+poisoning in the standard library's `Mutex<T>` type. This library offers poisoning without assuming
+locks.
+
 ## Detecting invalid state
 
 In simple cases, we can just access a value, and if a panic occurs the value will be poisoned:
