@@ -61,7 +61,7 @@ There are two methods for acquiring guards to access state protected by a `Poiso
 They're both static rather than inherent:
 
 - [`Poison::on_unwind`] for guards that only poison if a panic unwinds through them.
-- [`Poison::unless_restored`] for guards that remain poisoned unless they're explicitly recovered
+- [`Poison::unless_recovered`] for guards that remain poisoned unless they're explicitly recovered
 after operating on their state. These also protect against early returns from `?`.
 
 ## Recovering state
@@ -265,7 +265,7 @@ impl<T> Poison<T> {
     /**
     Whether or not the value is poisoned.
 
-    If this method returns `true` then [`Poison::get`], [`Poison::on_unwind`], [`Poison::unless_restored`]
+    If this method returns `true` then [`Poison::get`], [`Poison::on_unwind`], [`Poison::unless_recovered`]
     etc will return `Ok`. Otherwise these methods will return `Err` with a recovery guard.
     */
     pub fn is_poisoned(&self) -> bool {

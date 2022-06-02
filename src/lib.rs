@@ -1,5 +1,5 @@
 /*!
-Utilities for maintaining sane state in the presence of panics and failures.
+c
 
 This library contains [`Poison<T>`], which implements poisoning independently of locks or
 other mechanisms for sharing state.
@@ -9,14 +9,20 @@ other mechanisms for sharing state.
 Poisoning is a general strategy for keeping state consistent by blocking direct access to
 state if a previous user did something unexpected with it.
 
-Poisoning can be applied anywhere there's complex state management at play, but is particularly
-useful for cordoning off external resources, like files, that may become corrupted. Rust implements
-poisoning in the standard library's `Mutex<T>` type. This library offers poisoning without assuming
-locks.
+Rust implements poisoning in the standard library's `Mutex<T>` type. This library offers poisoning
+without assuming locks. The standard library's poisoning is only concerned with panics, because
+they don't have an in-band signal like `?` to suggest an early return from a block of code is possible.
+Code may not be written to expect panics. Poisoning offers a general solution for such code.
+
+The `Poison<T>` in this library also supports poisoning for other exceptional circumstances besides
+panics. Poisoning can be applied anywhere there's complex state management at play, but is particularly
+useful for cordoning off external resources, like files, that may become corrupted without panicking.
 
 ## Detecting invalid state
 
-In simple cases, we can just access a value, and if a panic occurs the value will be poisoned:
+In simple cases, we can just access a value, and if a panic occurs the value will be poisoned.
+This example defines an `Account`, with an invariant that the total balance is always equal to
+the sum of its changes. We can protect this invariant using `Poison<T>`:
 
 ```
 use poison_guard::Poison;
@@ -24,8 +30,8 @@ use poison_guard::Poison;
 struct Account(Poison<AccountState>);
 
 struct AccountState {
-    // The total _must_ be the sum of all changes
     total: i64,
+    // Invariant: the total must be the sum of the changes
     changes: Vec<i64>,
 }
 
@@ -35,16 +41,30 @@ impl Account {
     }
 
     pub fn push_change(&mut self, change: i64) {
-        let mut state = Poison::on_unwind(&mut self.0).unwrap();
+        // In order to access our `AccountState` we need to get a poison guard
+        let mut state = match Poison::on_unwind(&mut self.0) {
+            // If our state was not poisoned then we can work with it
+            Ok(state) => state,
+            // If our state was poisoned then try to restore our invariant
+            // After that we'll be able to use it again
+            Err(poisoned) => poisoned.recover_with(|state| {
+                state.total = state.changes.iter().sum();
+            })
+        };
 
+        // Make some updates to the state
         state.changes.push(change);
 
-        // If we panic here, our state will poison
-        // The total won't be the sum of all changes, but that's ok
-        // Future callers won't be able to access the state without
-        // attempting to recover it first
+        // If we panic here then our state is invalid.
+        // The `Poison::on_unwind` call above will start
+        // to panic rather than letting us continue to access
+        // the broken state
 
-        state.total = state.changes.iter().copied().sum();
+        state.total += change;
+
+        // At this point the guard falls out of scope and the
+        // state is considered valid. Future callers will
+        // succeed when they call `Poison::on_unwind`
     }
 
     pub fn total(&self) -> i64 {
@@ -53,8 +73,9 @@ impl Account {
 }
 ```
 
-Say we're writing data to a file. If an individual write fails we might not know exactly what state
-the file has been left in on-disk and need to recover it before accessing again:
+More complex usecases may need to poison in other cases besides panics. Say we're writing data to a file.
+If an individual write fails we might not know exactly what state the file has been left in on-disk
+and need to recover it before accessing again:
 
 ```
 use poison_guard::Poison;
@@ -77,8 +98,7 @@ impl Writer {
         let mut file = Poison::unless_recovered(&mut self.file)
             .or_else(|poisoned| {
                 // If the value was poisoned, we'll try recover it
-                // This means some past user either panicked or explicitly
-                // poisoned the value
+                // Maybe one of our previous writes partially failed?
                 poisoned.try_recover_with(|file| Writer::check_and_fix(file))
             })
             .map_err(|poisoned| poisoned.into_error())?;
